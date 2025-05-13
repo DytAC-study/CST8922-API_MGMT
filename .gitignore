@@ -1,0 +1,45 @@
+# Python (if using scripts for JWT generation)
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+env/
+venv/
+.Python
+
+# OpenSSL key files
+*.key
+*.pem
+
+# Kubernetes manifests (optional, if you regenerate them)
+*.yaml~
+*.bak
+*.log
+
+# Secrets and sensitive configs
+secrets.env
+*.crt
+*.enc
+*.secret
+
+# Postman and tools
+*.postman_collection.json
+*.postman_environment.json
+
+# VSCode and IDE junk
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS/macOS/Windows system files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Helm cache/lock files
+charts/
+Chart.lock
+
+# JWTs
+*.jwt
