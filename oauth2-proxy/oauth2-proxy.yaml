@@ -21,30 +21,16 @@ spec:
             - --provider=github
             - --http-address=0.0.0.0:4180
             - --upstream=http://backend-api.default.svc.cluster.local
-            - --cookie-secret=replace-this-32B-base64
-            - --client-id=REPLACE_WITH_YOURS
-            - --client-secret=REPLACE_WITH_YOURS
-            - --redirect-url=http://localhost:4180/oauth2/callback
+            - --scope=user:email
             - --email-domain=*
+            - --client-id=Ov23li5oY0IBjJ9BPMah
+            - --client-secret=3dc0182d49f0e665cf30d8ae3bacfb7133281d97
+            - --redirect-url=http://localhost:4180/oauth2/callback
+            - --cookie-secret=-sLi8SX'?M"{_Om`4|}k&d,tgG:[hy>p
+            - --cookie-secure=false
             - --set-authorization-header=true
-            - --jwt-key-file=/etc/secrets/private.key
-          ports:
-            - containerPort: 4180
-          resources:
-            requests:
-              cpu: 100m
-              memory: 128Mi
-            limits:
-              cpu: 250m
-              memory: 256Mi
-          volumeMounts:
-            - name: jwt-key
-              mountPath: /etc/secrets
-              readOnly: true
-      volumes:
-        - name: jwt-key
-          secret:
-            secretName: jwt-private-key
+            - --show-debug-on-error=true
+      restartPolicy: Always
 ---
 apiVersion: v1
 kind: Service

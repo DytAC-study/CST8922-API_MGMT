@@ -96,15 +96,29 @@ Let's build the simple backend API first.
 ### `backend-api/app.py`
 
 ```python
-from flask import Flask
+from flask import Flask, request, jsonify
+
 app = Flask(__name__)
 
 @app.route("/api/hello")
 def hello():
-    return {"message": "Hello from the backend!"}
+    return jsonify({
+        "message": "Hello from backend API",
+        "user": request.headers.get("X-Forwarded-User"),
+        "email": request.headers.get("X-Forwarded-Email")
+    })
+
+@app.route("/")
+def index():
+    return jsonify({
+        "message": "OAuth2 Proxy is working",
+        "user": request.headers.get("X-Forwarded-User"),
+        "email": request.headers.get("X-Forwarded-Email")
+    })
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
+
 ```
 
 ### `backend-api/Dockerfile`
@@ -205,7 +219,7 @@ minikube start --driver=docker
 ### 2. Apply the Deployment
 
 ```bash
-kubectl apply -f backend-api/deployment.yaml
+kubectl apply -f backend-api/deployment.yaml --validate=false
 ```
 
 ### 3. Check Pods and Services
@@ -323,10 +337,10 @@ You’ll get:
 - Admin: `http://127.0.0.1:xxxxx` ← used to POST configs
 - Proxy: `http://127.0.0.1:yyyyy` ← used to test `/api/hello`
 
-Test it:
+Test it (kong-admin):
 
 ```
-curl.exe -k https://127.0.0.1:54435/services
+curl.exe -k https://127.0.0.1:<admin-port>/services
 ```
 
 You may see something like:
@@ -336,6 +350,33 @@ You may see something like:
 ```
 
 because there's no registered service.
+If there's service and we want to clean them:
+
+1. check which services we have:
+
+```
+curl.exe -k https://127.0.0.1:<admin-port>/services
+```
+
+2. for each service, check routes first, then delete:
+
+   ```
+   curl.exe -k https://127.0.0.1:<admin-port>/services/backend-api/routes
+   ```
+
+   get each route's ID, then delete：
+
+   ```
+   curl.exe -k -X DELETE https://127.0.0.1:<admin-port>/routes/f372164a-xxxx-xxxx
+   ```
+
+3. delete service:
+
+   ```
+   curl.exe -k -X DELETE https://127.0.0.1:<admin-port>/services/backend-api
+   ```
+
+   
 
 ------
 
@@ -344,7 +385,7 @@ because there's no registered service.
 Use this command in PowerShell:
 
 ```powershell
-curl.exe -k -i -X POST https://127.0.0.1:54435/services `
+curl.exe -k -i -X POST https://127.0.0.1:<admin-port>/services `
   --data "name=backend-api" `
   --data "url=http://backend-api.default.svc.cluster.local"
 ```
@@ -378,7 +419,11 @@ Server: kong/3.9.0
 ## 🧭 Step 4.4: Register Route for `/api/hello`
 
 ```powershell
-curl.exe -k -X POST https://127.0.0.1:54435/services/backend-api/routes `
+curl.exe -k -X POST https://127.0.0.1:<admin-port>/services/backend-api/routes `
+  --data "paths[]=/" `
+  --data "strip_path=false"
+  
+curl.exe -k -X POST https://127.0.0.1:<admin-port>/services/backend-api/routes `
   --data "paths[]=/api/hello" `
   --data "strip_path=false"
 ```
@@ -390,13 +435,18 @@ Tell Kong not to strip the path. That way, Kong forwards `/api/hello` → `/api/
 ### ✅ 1. Service in Kong is defined like this:
 
 ```powershell
-curl.exe -k https://127.0.0.1:54435/services
+curl.exe -k https://127.0.0.1:<admin-port>/services
 ```
 
 You should see:
 
 ```json
-"url": "http://backend-api.default.svc.cluster.local"
+{
+  "protocol": "http",
+  "host": "backend-api.default.svc.cluster.local",
+  "port": 80,
+  "path": null
+}
 ```
 
 ------
@@ -406,7 +456,7 @@ You should see:
 Check:
 
 ```bash
-curl.exe -k https://127.0.0.1:54435/routes
+curl.exe -k https://127.0.0.1:<admin-port>/routes
 ```
 
 You should see something like:
@@ -519,13 +569,13 @@ This limits how many times **anyone** can call the route.
 Run:
 
 ```powershell
-curl.exe -k https://127.0.0.1:54435/routes
+curl.exe -k https://127.0.0.1:<admin-port>/routes
 ```
 
 Look for the `id` of the route with:
 
-```
-jsonCopyEdit"paths": ["/api/hello"],
+```json
+"paths": ["/api/hello"],
 "strip_path": false
 ```
 
@@ -607,7 +657,7 @@ Enhance API security by requiring clients to:
 ## 🧱 Step 6.1: Create a Consumer in Kong
 
 ```
-curl.exe -k -X POST "https://127.0.0.1:54435/consumers" --data "username=demo-user"
+curl.exe -k -X POST "https://127.0.0.1:<admin-port>/consumers" --data "username=demo-user"
 ```
 
 ## 🔑 Step 6.2: Register a JWT Credential with Public Key
@@ -640,8 +690,16 @@ curl.exe -k -X POST "https://127.0.0.1:54435/consumers/demo-user/jwt" `
 ## 🔌 Step 6.3: Enable JWT Plugin on the Route
 
 ```
-curl.exe -k -X POST "https://127.0.0.1:54435/routes/f372164a-70d3-40a6-931e-dc59284a3988/plugins" --data "name=jwt"
+curl.exe -k -X POST "https://127.0.0.1:<admin-port>/routes/f372164a-70d3-40a6-931e-dc59284a3988/plugins" --data "name=jwt"
 ```
+
+Check JWT setting:
+
+```
+curl.exe -k https://127.0.0.1:<admin-port>/consumers/demo-user/jwt
+```
+
+
 
 ## 🧪 Step 6.4: Create and Sign a JWT for Testing
 
@@ -747,8 +805,14 @@ curl.exe -k -X POST "https://127.0.0.1:54435/routes/f372164a-70d3-40a6-931e-dc59
 
   ### 🧪 Example Signed JWT Request
 
-  Use the token in Postman or curl:
+  Use the token via curl:
 
+  ```
+  curl.exe -H "Authorization: Bearer <your_jwt_token>" http://127.0.0.1:<proxy-port>/api/hello
+  ```
+  
+  Use the token in Postman or curl:
+  
   ```
   GET http://127.0.0.1:<proxy-port>/api/hello
   Authorization: Bearer <your-jwt-token>
@@ -759,9 +823,9 @@ curl.exe -k -X POST "https://127.0.0.1:54435/routes/f372164a-70d3-40a6-931e-dc59
   ```json
   {"message": "Hello from the backend!"}
   ```
-
+  
   If not:
-
+  
   ```
   HTTP/1.1 401 Unauthorized
   ```
@@ -798,77 +862,31 @@ curl.exe -k -X POST "https://127.0.0.1:54435/consumers/demo-user/plugins" --data
 
 
 
-# ✅ Step 7 (Rewritten): OAuth2 Proxy + JWT Auth + Per-Consumer Rate Limit + Logging (DB Mode)
-
-------
+# ✅ Step 7: OAuth2 Proxy + Per-Consumer Rate Limit + Logging
 
 ## 🎯 Objective
 
-Demonstrate how Kong can:
+This step demonstrates how to:
 
-- Accept JWTs signed by a trusted OAuth2 Proxy
-- Enforce route access via JWT
-- Apply per-user rate limiting
-- Log authenticated traffic for auditing and debugging
+- Use **OAuth2 Proxy with GitHub login** to authenticate users
+- Enable **per-consumer rate limiting** in Kong
+- Enable **request logging** to a mock service
 
-------
-
-## 🔐 Step 7.1: Add OAuth2 Proxy to Automate JWT Flow
-
-## 🎯 Goal
-
-Allow users to log in via GitHub and receive a **JWT automatically** — no manual JWT copy-pasting required. This makes your Kong-secured route usable in a browser or with live OAuth2-based identity.
+We intentionally skipped the JWT plugin, since OAuth2 Proxy uses **cookies** to manage sessions and does **not expose a JWT** by default for frontend access.
 
 ------
 
-## 🔧 Deployment Steps
+## 🔐 Step 1: Deploy OAuth2 Proxy (GitHub)
 
-### 🛠 1. Create a GitHub OAuth App
-
-In your GitHub account:
-
-1. Go to **Settings > Developer Settings > OAuth Apps**
-2. Register a new app:
-   - **Homepage URL**: `http://localhost:4180`
-   - **Authorization Callback URL**: `http://localhost:4180/oauth2/callback`
-3. Note the:
-   - `Client ID`
-   - `Client Secret`
-
-------
-
-### 📦 2. Generate a JWT RSA key pair
-
-If you haven’t done so yet:
-
-```
-openssl genrsa -out private.key 2048
-openssl rsa -in private.key -pubout -out public.pem
-```
-
-Use `public.pem` with Kong (`key=demo-key`)
- Mount `private.key` inside the OAuth2 Proxy pod.
-
-------
-
-### 🧱 3. Create a Kubernetes `Secret` for the private key
-
-```
-kubectl create secret generic jwt-private-key \
-  --from-file=private.key=./private.key
-```
-
-------
-
-### 📄 4. Deploy `oauth2-proxy`
-
-Here’s a minimal `oauth2-proxy.yaml`:
+Here's a working `oauth2-proxy.yaml`:
 
 ```
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: oauth2-proxy
+  labels:
+    app: oauth2-proxy
 spec:
   replicas: 1
   selector:
@@ -880,423 +898,95 @@ spec:
         app: oauth2-proxy
     spec:
       containers:
-      - name: oauth2-proxy
-        image: quay.io/oauth2-proxy/oauth2-proxy:v7.4.0
-        args:
-        - --provider=github
-        - --http-address=0.0.0.0:4180
-        - --upstream=http://backend-api.default.svc.cluster.local
-        - --cookie-secret=replace-this-32B-base64
-        - --client-id=REPLACE_WITH_YOURS
-        - --client-secret=REPLACE_WITH_YOURS
-        - --redirect-url=http://localhost:4180/oauth2/callback
-        - --email-domain=*
-        - --set-authorization-header=true
-        - --jwt-signing-key=/etc/secrets/private.key
-        volumeMounts:
-        - name: jwt-key
-          mountPath: /etc/secrets
-          readOnly: true
-      volumes:
-      - name: jwt-key
-        secret:
-          secretName: jwt-private-key
+        - name: oauth2-proxy
+          image: quay.io/oauth2-proxy/oauth2-proxy:v7.4.0
+          args:
+            - --provider=github
+            - --http-address=0.0.0.0:4180
+            - --upstream=http://backend-api.default.svc.cluster.local
+            - --scope=user:email
+            - --email-domain=*
+            - --client-id=Ov23li5oY0IBjJ9BPMah
+            - --client-secret=3dc0182d49f0e665cf30d8ae3bacfb7133281d97
+            - --redirect-url=http://localhost:4180/oauth2/callback
+            - --cookie-secret=-sLi8SX'?M"{_Om`4|}k&d,tgG:[hy>p
+            - --cookie-secure=false
+            - --set-authorization-header=true
+            - --show-debug-on-error=true
+      restartPolicy: Always
 ---
 apiVersion: v1
 kind: Service
 metadata:
   name: oauth2-proxy
 spec:
-  ports:
-  - port: 80
-    targetPort: 4180
   selector:
     app: oauth2-proxy
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 4180
 ```
 
-Apply it:
+🔍 This config enables GitHub login and sends requests (with headers) to the backend service via Kong.
+
+------
+
+## 👤 Step 2: Register a Kong Consumer
 
 ```
-kubectl apply -f oauth2-proxy.yaml
+curl.exe -k -X POST https://127.0.0.1:<admin-port>/consumers `
+  --data username=demo-user
+```
+
+This represents an individual user account in Kong (optional if you're only tracking logs).
+
+------
+
+## 🔄 Step 3: Add Rate Limiting for Authenticated Users
+
+```
+curl.exe -k -X POST https://127.0.0.1:<admin-port>/routes/<route-id>/plugins `
+  --data name=rate-limiting `
+  --data config.minute=5 `
+  --data config.policy=local
 ```
 
 ------
 
-### 🌐 5. Access the login flow
+## 📦 Step 4: Enable Logging Plugin
 
 ```
-kubectl port-forward svc/oauth2-proxy 4180:80
+kubectl run mock-logger --image=kennethreitz/httpbin --port=80
+kubectl expose pod mock-logger --port=80 --target-port=80 --name=mock-logger
 ```
 
-Open your browser:
-
-```
-http://localhost:4180/oauth2/start
-```
-
-✅ You’ll be redirected to GitHub to log in
- ✅ On success, OAuth2 Proxy will inject a JWT into:
-
-- `Authorization: Bearer <JWT>` header (used by Kong)
-- or a cookie (optional)
-
-------
-
-### ✅ 6. Test It with Kong
-
-Use Postman or browser to call:
-
-```
-javascriptCopyEditGET http://127.0.0.1:<kong-proxy-port>/api/hello
-Authorization: Bearer <OAuth2 Proxy JWT>
-```
-
-✅ You should pass Kong’s JWT check and see the Flask response
- ✅ If rate limiting is set for your `demo-user`, that will also apply
-
-## 👤 Step 7.2: Ensure Kong Consumer Exists
-
-If not already created:
+Then enable plugin:
 
 ```powershell
-curl.exe -k -X POST https://127.0.0.1:54435/consumers --data "username=demo-user"
+curl.exe -k -X POST https://127.0.0.1:<admin-port>/routes/<route-id>/plugins `
+  --data name=http-log `
+  --data config.http_endpoint=http://mock-logger.default.svc.cluster.local/post `
+  --data config.method=POST
 ```
 
 ------
 
-## 🔑 Step 7.3: Register Public Key for JWT Verification
+## 🧪 Step 5: Test With Postman
 
-If not already done:
+1. **Login via Browser**
 
-```
-powershellCopyEdit$pubkey = Get-Content .\public.pem -Raw
-curl.exe -k -X POST "https://127.0.0.1:54435/consumers/demo-user/jwt" `
-  --data "algorithm=RS256" `
-  --data-urlencode "rsa_public_key=$pubkey" `
-  --data "key=demo-key"
-```
+   Open `http://localhost:4180/oauth2/start` in a browser and complete GitHub login.
 
-------
+2. **Grab Cookies from DevTools**
 
-## 🔌 Step 7.4: Enable JWT Plugin on the `/api/hello` Route
+   After login, inspect browser cookies (domain `localhost`) → find `_oauth2_proxy`.
 
-```
-powershellCopyEditcurl.exe -k -X POST https://127.0.0.1:54435/routes/f372164a-70d3-40a6-931e-dc59284a3988/plugins `
-  --data "name=jwt"
-```
+3. **Send Authenticated Request via Postman**
 
-✅ This tells Kong to expect and validate JWTs on that route.
-
-------
-
-## 🔒 Step 7.5: Enable Rate Limiting for the JWT Consumer
-
-```
-powershellCopyEditcurl.exe -k -X POST https://127.0.0.1:54435/consumers/demo-user/plugins `
-  --data "name=rate-limiting" `
-  --data "config.minute=3" `
-  --data "config.policy=local"
-```
-
-🎯 Limits this specific user to 3 requests/min, regardless of what others do.
-
-------
-
-## 📦 Step 7.6: Enable HTTP Logging for JWT-Protected Route
-
-```
-powershellCopyEditcurl.exe -k -X POST "https://127.0.0.1:54435/routes/f372164a-70d3-40a6-931e-dc59284a3988/plugins" `
-  --data "name=http-log" `
-  --data "config.http_endpoint=http://mock-logger.default.svc.cluster.local/post" `
-  --data "config.method=POST"
-```
-
-🔎 Now Kong will log JWT-authenticated traffic to the mock endpoint for observability.
-
-------
-
-## 🧪 Step 7.7: Test the End-to-End Flow
-
-1. Visit OAuth2 Proxy’s `/oauth2/start`
-
-2. Log in and copy your `Authorization: Bearer <JWT>` header
-
-3. Use Postman or curl to call:
-
-   ```
-   perlCopyEditGET http://<kong-proxy-url>/api/hello
-   Authorization: Bearer <JWT>
+   ```bash
+   GET http://localhost:4180/api/hello
+   Cookie: _oauth2_proxy=<copied-cookie-value>
    ```
 
-4. Check that:
-
-   - ✅ Request succeeds
-   - 🔄 Logging is triggered
-   - ❌ Request #4 (within a minute) is rate-limited (429)
-
-
-
-
-
-------
-
-# 🎤 Demo Script: Scalable API Management (Kong + JWT + Rate Limiting)
-
-> ⏱️ Target Duration: 1 hour (with smooth handoffs between teammates)
-
-------
-
-## 🔰 1. Demo Introduction (2–3 mins)
-
-**Presenter A:**
-
-> "Hi everyone, today we’ll demonstrate how to secure, monitor, and scale APIs using **Kong Gateway** with features like **rate limiting** and **JWT-based authentication**.
->  We'll walk you through a real-world Kubernetes setup using Kong OSS, a Flask API, OAuth2 Proxy, and GitHub as our identity provider."
-
-------
-
-## 🧱 2. Backend API Deployment (3–5 mins)
-
-**Presenter B (shares screen):**
-
-> "Let’s start with our backend — a simple Flask API deployed to Kubernetes."
-
-### Actions:
-
-- Show `app.py`: returns “Hello from backend”
-
-- Show `deployment.yaml`
-
-- Run:
-
-  ```bash
-  kubectl apply -f backend-api/deployment.yaml
-  kubectl get pods
-  ```
-
-> "This deploys our API and exposes it as a ClusterIP service inside Kubernetes."
-
-------
-
-## 🌐 3. Deploy Kong Gateway (3–5 mins)
-
-**Presenter C:**
-
-> "Now we deploy Kong OSS using Helm."
-
-### Actions:
-
-- Run:
-
-  ```bash
-  helm install kong kong/kong -n kong --create-namespace \
-    --set ingressController.installCRDs=false \
-    --set proxy.type=NodePort \
-    --set admin.type=NodePort
-  ```
-
-- Show:
-
-  ```bash
-  minikube service -n kong kong-kong-proxy --url
-  ```
-
-------
-
-## 🔗 4. Register API Service and Route in Kong (5–7 mins)
-
-**Presenter C:**
-
-> "Now we’ll use Kong’s Admin API to register our backend service and route traffic to it."
-
-### Actions:
-
-```bash
-curl -X POST $KONG_ADMIN_URL/services \
-  --data name=backend-api \
-  --data url=http://backend-api.default.svc.cluster.local
-
-curl -X POST $KONG_ADMIN_URL/services/backend-api/routes \
-  --data paths[]=/api/hello
-```
-
-> "Let’s test that with Postman."
-
-- Show response from `http://<kong-proxy-url>/api/hello`
-
-------
-
-## 🚫 5. Global Rate Limiting (5 mins)
-
-**Presenter D:**
-
-> "To prevent abuse, we’ll now apply a **global rate limit** of 5 requests/minute."
-
-### Actions:
-
-```bash
-curl -X POST $KONG_ADMIN_URL/routes/<route-id>/plugins \
-  --data name=rate-limiting \
-  --data config.minute=5 \
-  --data config.policy=local
-```
-
-- Demo sending 5+ requests in Postman
-- Show 429 Too Many Requests
-
-------
-
-## 🔐 6. OAuth2 Proxy Authentication (10 mins)
-
-**Presenter A:**
-
-> "Now let’s secure our API using **OAuth2 Proxy**, which authenticates via GitHub."
-
-### Actions:
-
-- Explain GitHub OAuth setup (show dummy values)
-
-- Apply `oauth2-proxy/deployment.yaml`
-
-- Run:
-
-  ```bash
-  minikube service oauth2-proxy --url
-  ```
-
-- Visit `/oauth2/start`, log in via GitHub
-
-> "After logging in, we receive a JWT that can be passed to Kong."
-
-------
-
-## 🔑 7. JWT Plugin in Kong (8–10 mins)
-
-**Presenter B:**
-
-> "We’ll now configure Kong to validate that JWT and allow access only if it's valid."
-
-### Actions:
-
-- Create consumer:
-
-  ```bash
-  curl -X POST $KONG_ADMIN_URL/consumers \
-    --data username=demo-user
-  ```
-
-- Upload public key:
-
-  ```bash
-  curl -X POST $KONG_ADMIN_URL/consumers/demo-user/jwt \
-    --data algorithm=RS256 \
-    --data rsa_public_key="..." \
-    --data key=demo-key
-  ```
-
-- Enable JWT plugin:
-
-  ```bash
-  curl -X POST $KONG_ADMIN_URL/routes/<route-id>/plugins \
-    --data name=jwt
-  ```
-
-> "Now, only requests with valid JWTs will go through."
-
-- Test: Postman → JWT → `/api/hello`
-
-------
-
-## 📊 8. Per-User Rate Limiting (5–6 mins)
-
-**Presenter D:**
-
-> "We can now apply **per-consumer limits**, like 3 requests/min per logged-in user."
-
-### Actions:
-
-```bash
-curl -X POST $KONG_ADMIN_URL/consumers/demo-user/plugins \
-  --data name=rate-limiting \
-  --data config.minute=3 \
-  --data config.policy=local
-```
-
-- Show difference: user A vs. unauthenticated user
-- Simulate two users (or show logs with different tokens)
-
-------
-
-## 📦 9. Wrap-Up & Real-World Applications (2 mins)
-
-**All Together:**
-
-> "This setup allows you to:
->
-> - Protect APIs using standard auth (OAuth2 / JWT)
-> - Control traffic usage fairly
-> - Scale safely without overloading your services"
-
-> "It’s ideal for multi-tenant platforms, API products, and cloud-native apps."
-
-------
-
-## ❓ 10. Q&A and Discussion (15 mins)
-
-- Prepare a few fallback questions if the class is silent:
-  - “How would this change in a production environment?”
-  - “Why use Kong over an API key system?”
-  - “What if your backend supports gRPC instead of HTTP?”
-
-
-
-# ✅ GitHub Repo Structure (Recommended)
-
-Here's a structure that matches your presentation flow and supports hands-on demos:
-
-```bash
-scalable-api-management-demo/
-├── backend-api/
-│   ├── app.py
-│   ├── Dockerfile
-│   └── deployment.yaml
-├── kong/
-│   ├── kong-service-setup.md         # curl commands for Admin API
-│   └── screenshots/                  # (optional) Postman/Kong UIs
-├── oauth2-proxy/
-│   ├── deployment.yaml
-│   ├── config-reference.md           # (optional) explain args/env
-├── ingress/                          # (optional) if using KongIngress
-├── secrets/                          # .gitignore — describe what to generate (e.g., private.key)
-├── setup-guide.md                    # 👈 MASTER INSTRUCTION FILE
-├── README.md                         # overview of repo and tools
-└── slides/
-    ├── presentation.pptx
-    └── demo-script.pdf
-```
-
-------
-
-# 📘 `README.md` Template (overview)
-
-```markdown
-# Scalable API Management Demo
-
-This project demonstrates scalable API management using Kong OSS, OAuth2 Proxy, JWT Auth, and Kubernetes.
-
-## Key Features
-- Kong API Gateway with declarative and Admin API setups
-- Global and per-user rate limiting
-- OAuth2 login via GitHub and JWT validation
-- Backend Flask API served in Kubernetes
-
-## Tools
-- Kong Gateway OSS
-- OAuth2 Proxy
-- Postman
-- Kubernetes (Minikube)
-- GitHub OAuth
-
-## Quick Start
-See [setup-guide.md](./setup-guide.md) for full deployment instructions.
-```
+   ✅ You should see your Flask app log the request, and the mock logger will receive a log.
