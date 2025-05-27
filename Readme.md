@@ -518,31 +518,6 @@ http://127.0.0.1:31234/api/hello
 {"message": "Hello from the backend!"}
 ```
 
-- If rate limiting is active and you’ve hit the limit, you’ll see:
-
-```
-HTTP 429 Too Many Requests
-```
-
-------
-
-### 🔍 3. Optional: View headers
-
-In the **response headers**, you’ll see:
-
-- `X-RateLimit-Limit: 5`
-- `X-RateLimit-Remaining: 0`
-- `Retry-After: 60`
-
-These tell you that Kong’s **rate-limiting plugin** is working.
-
-------
-
-### 💡 Extra Tips:
-
-- You don’t need to add any headers or body — just a `GET` request is enough.
-- If you later add **JWT auth**, you’ll need to add a **Bearer Token** under the **Authorization** tab.
-
 
 
 # ✅ Step 5: Add Plugins to Secure and Scale Your API (DB Mode)
@@ -590,7 +565,7 @@ f372164a-70d3-40a6-931e-dc59284a3988
 ### ✅ Step 2: Add the rate-limiting plugin
 
 ```powershell
-curl.exe -k -X POST https://127.0.0.1:54435/routes/f372164a-70d3-40a6-931e-dc59284a3988/plugins `
+curl.exe -k -X POST https://127.0.0.1:<admin-port>/routes/f372164a-70d3-40a6-931e-dc59284a3988/plugins `
   --data "name=rate-limiting" `
   --data "config.minute=5" `
   --data "config.policy=local"
@@ -679,7 +654,7 @@ openssl rsa -in private.key -pubout -out public.pem
 ### Upload the **public key** to Kong:
 
 ```
-curl.exe -k -X POST "https://127.0.0.1:54435/consumers/demo-user/jwt" `
+curl.exe -k -X POST "https://127.0.0.1:<admin-port>/consumers/demo-user/jwt" `
   --data "algorithm=RS256" `
   --data-urlencode "rsa_public_key=$(Get-Content .\public.pem -Raw)" `
   --data "key=demo-key"
@@ -855,32 +830,83 @@ HTTP/1.1 401 Unauthorized
 ## 📊 Step 6.6: Apply Rate-Limiting per Consumer
 
 ```
-curl.exe -k -X POST "https://127.0.0.1:54435/consumers/demo-user/plugins" --data "name=rate-limiting" --data "config.minute=3" --data "config.policy=local"
+curl.exe -k -X POST "https://127.0.0.1:<admin-port>/consumers/demo-user/plugins" --data "name=rate-limiting" --data "config.minute=3" --data "config.policy=local"
 ```
 
 ✅ Now each JWT-authenticated user is limited individually to 3 requests per minute.
 
-
-
-# ✅ Step 7: OAuth2 Proxy + Per-Consumer Rate Limit + Logging
-
-## 🎯 Objective
-
-This step demonstrates how to:
-
-- Use **OAuth2 Proxy with GitHub login** to authenticate users
-- Enable **per-consumer rate limiting** in Kong
-- Enable **request logging** to a mock service
-
-We intentionally skipped the JWT plugin, since OAuth2 Proxy uses **cookies** to manage sessions and does **not expose a JWT** by default for frontend access.
+## ✅ Step 7: Logging + Monitoring First, then Add OAuth2
 
 ------
 
-## 🔐 Step 1: Deploy OAuth2 Proxy (GitHub)
+## 🎯 Objective
 
-Here's a working `oauth2-proxy.yaml`:
+In this step, we will **first establish API observability and control**, and then layer on **user authentication** using OAuth2 Proxy.
 
+Specifically, we'll:
+
+- ✅ Enable **request logging** with Kong using `http-log` plugin
+- ✅ Enable **per-consumer rate limiting**
+- ✅ Later, introduce **OAuth2 login with GitHub**
+- ⚠️ Skip the JWT plugin (OAuth2 Proxy manages sessions via cookies)
+
+------
+
+## 7.1: Enable Request Logging with `http-log` Plugin
+
+### 🧱 1. Deploy a mock logging service
+
+```bash
+kubectl run mock-logger --image=kennethreitz/httpbin --port=80
+kubectl expose pod mock-logger --port=80 --target-port=80 --name=mock-logger
 ```
+
+### 🧩 2. Enable Kong http-log plugin on a specific route
+
+```powershell
+curl.exe -k -X POST https://127.0.0.1:<admin-port>/routes/<your-route-id>/plugins `
+  --data name=http-log `
+  --data config.http_endpoint=http://mock-logger.default.svc.cluster.local/post `
+  --data config.method=POST `
+  --data config.timeout=1000 `
+  --data config.keepalive=1000
+```
+
+✅ You can now inspect logs from:
+
+```bash
+kubectl logs pod/<mock-logger-pod-name>
+```
+
+------
+
+## 7.2: Add Rate Limiting
+
+Optional but useful for demonstrating control at the consumer level:
+
+```powershell
+curl.exe -k -X POST https://127.0.0.1:<admin-port>/routes/<route-id>/plugins `
+  --data name=rate-limiting `
+  --data config.minute=5 `
+  --data config.policy=local
+```
+
+------
+
+## 7.3: Register a Kong Consumer (Optional for Logging, Required for OAuth2)
+
+```powershell
+curl.exe -k -X POST https://127.0.0.1:<admin-port>/consumers `
+  --data username=demo-user
+```
+
+------
+
+## 7.4: Deploy OAuth2 Proxy (GitHub Login)
+
+> This adds GitHub login and passes user info to the backend.
+
+```yaml
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -913,7 +939,6 @@ spec:
             - --cookie-secure=false
             - --set-authorization-header=true
             - --show-debug-on-error=true
-      restartPolicy: Always
 ---
 apiVersion: v1
 kind: Service
@@ -928,65 +953,33 @@ spec:
       targetPort: 4180
 ```
 
-🔍 This config enables GitHub login and sends requests (with headers) to the backend service via Kong.
+Deploy this Oauth2-proxy and forward the port:
 
-------
-
-## 👤 Step 2: Register a Kong Consumer
-
-```
-curl.exe -k -X POST https://127.0.0.1:<admin-port>/consumers `
-  --data username=demo-user
-```
-
-This represents an individual user account in Kong (optional if you're only tracking logs).
-
-------
-
-## 🔄 Step 3: Add Rate Limiting for Authenticated Users
-
-```
-curl.exe -k -X POST https://127.0.0.1:<admin-port>/routes/<route-id>/plugins `
-  --data name=rate-limiting `
-  --data config.minute=5 `
-  --data config.policy=local
+```bash
+kubectl apply -f .\oauth2-proxy\oauth2-proxy.yaml
+kubectl port-forward service/oauth2-proxy 4180:80
 ```
 
 ------
 
-## 📦 Step 4: Enable Logging Plugin
+## 7.5: Test End-to-End Flow
 
-```
-kubectl run mock-logger --image=kennethreitz/httpbin --port=80
-kubectl expose pod mock-logger --port=80 --target-port=80 --name=mock-logger
-```
+### ✅ 1. Open browser:
 
-Then enable plugin:
-
-```powershell
-curl.exe -k -X POST https://127.0.0.1:<admin-port>/routes/<route-id>/plugins `
-  --data name=http-log `
-  --data config.http_endpoint=http://mock-logger.default.svc.cluster.local/post `
-  --data config.method=POST
+```bash
+http://localhost:4180/oauth2/start
 ```
 
-------
+### ✅ 2. Login via GitHub
 
-## 🧪 Step 5: Test With Postman
+### ✅ 3. Open Postman:
 
-1. **Login via Browser**
+```
+GET http://localhost:4180/api/hello
+Cookie: _oauth2_proxy=<your-cookie-value>
+```
 
-   Open `http://localhost:4180/oauth2/start` in a browser and complete GitHub login.
+### ✅ 4. Confirm in:
 
-2. **Grab Cookies from DevTools**
-
-   After login, inspect browser cookies (domain `localhost`) → find `_oauth2_proxy`.
-
-3. **Send Authenticated Request via Postman**
-
-   ```bash
-   GET http://localhost:4180/api/hello
-   Cookie: _oauth2_proxy=<copied-cookie-value>
-   ```
-
-   ✅ You should see your Flask app log the request, and the mock logger will receive a log.
+- `kubectl logs deployment/backend-api` → Flask receives request
+- `kubectl logs deployment/mock-logger` → Kong logs request data

@@ -24,7 +24,7 @@ spec:
             - --scope=user:email
             - --email-domain=*
             - --client-id=Ov23li5oY0IBjJ9BPMah
-            - --client-secret=3dc0182d49f0e665cf30d8ae3bacfb7133281d97
+            - --client-secret=28a117a77cca42b8dffa00a765970ffaa826bf22
             - --redirect-url=http://localhost:4180/oauth2/callback
             - --cookie-secret=-sLi8SX'?M"{_Om`4|}k&d,tgG:[hy>p
             - --cookie-secure=false

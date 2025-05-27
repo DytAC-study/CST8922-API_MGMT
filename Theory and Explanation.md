@@ -1,614 +1,241 @@
-# Scalable API Management with Rate Limiting and JWT Auth (Kong Gateway on Minikube)
+# Demo Architecture: Kong API Gateway with OAuth2 Proxy for API Protection and Auth
+
+## Introduction
+
+In modern microservice deployments, an **API Gateway** acts as a central entry point to enforce security, rate limiting, and monitoring across APIs. This report explains a demo architecture using **Kong** (an open-source API gateway) together with **OAuth2 Proxy** (for GitHub OAuth authentication) to protect a backend API. We describe how the system behaves and is configured in a local Minikube Kubernetes cluster versus in Azure Kubernetes Service (AKS), clarify the roles of each component (Kong, OAuth2 Proxy, backend API), and detail key configuration settings. We also overview **JWT authentication** (signing and validation) and how it relates to Kong and OAuth2 Proxy, including whether both can be combined. Finally, we briefly compare Kong to **Tyk** (another API gateway) in terms of plugin support, policy enforcement, authentication features, scalability, and monitoring.
+
+## Architecture and Components Overview
+
+**Components in the Demo Architecture:**
+
+- **Kong API Gateway (OSS)** – Deployed as an Ingress Controller in Kubernetes, Kong routes client requests to services and enforces policies like authentication and rate limiting. It sits at the cluster’s edge, exposing APIs to clients and forwarding requests to the backend[techtarget.com](https://www.techtarget.com/searchapparchitecture/tip/API-gateway-comparison-Kong-vs-Tyk#:~:text=Kong uses servers and a,plugins at the back end). Kong is highly extensible via plugins (e.g. auth, logging, rate limiting) and can run with or without a database for config storage[cloud.theodo.com](https://cloud.theodo.com/en/blog/kong-apigateway-kubernetes#:~:text=manage all API gateway routes).
+- **OAuth2 Proxy** – A dedicated authentication proxy that handles OAuth 2.0 login flows (in this case, with GitHub as the identity provider) and manages user sessions via cookies. It runs internally and ensures that only authenticated requests reach the backend. OAuth2 Proxy simplifies adding OAuth/OIDC login to apps without modifying the app code[developer.okta.com](https://developer.okta.com/blog/2022/07/14/add-auth-to-any-app-with-oauth2-proxy#:~:text=OAuth2 Proxy is a reverse,application have already been authorized).
+- **Backend API (Flask app)** – A simple application (e.g. a Python Flask service) that provides some API endpoint (like `/api/hello`). In our demo, it simply returns a greeting and echoes user info from headers. The backend is deployed in the cluster behind the gateway, and it trusts Kong/OAuth2 Proxy to handle auth (so the app can focus on core logic).
+- **Kubernetes (Minikube or AKS)** – The orchestration platform hosting all components. **Minikube** is used for local testing (simulating a cluster on a developer’s machine), while **AKS** is a managed cloud Kubernetes service for production. The architecture is similar on both, with minor differences in how services are exposed and configured.
+- **Client & Testing Tools** – We use **Postman** (or a web browser) to simulate client requests to the API. Postman helps in sending HTTP requests with tokens/cookies and observing responses for monitoring and tracing the request flow.
 
-## Introduction and Overview
+**High-Level Request Flow:**
 
-In modern microservice architectures, APIs need a **single entry point** to handle cross-cutting concerns like authentication, authorization, and traffic control. An **API Gateway** fulfills this role by sitting between clients and backend services (acting as a reverse proxy) and enforcing centralized policies. For our project, we focus on deploying **Kong API Gateway** (an open-source solution) in a local Kubernetes (Minikube) environment, protecting a simple Flask API with **JWT-based authentication** and **rate limiting**, and monitoring requests via tools like Postman. The presentation demonstrates how an API gateway can **secure and scale** API access – even in a local cluster – through configurable plugins and integration with an OAuth2 identity provider.
+When a client (e.g. Postman or a user’s browser) calls a protected API endpoint, the request first hits **Kong Gateway**. Kong applies any global or route-specific policies – for example, checking authentication (JWT token) or rate limits – before routing the request. In this setup, Kong forwards the request to the **OAuth2 Proxy** service (which is configured as the upstream for the protected API). The OAuth2 Proxy will ensure the user is authenticated: if no valid session is present, it triggers an OAuth login with GitHub; if the user **is** authenticated (cookie present), it adds user identity info to headers and proxies the request to the **backend API**. The backend API then returns the response (optionally including some of that user info) which bubbles back through Kong to the client. Kong can also log the request or apply response transformations as configured.
 
-**Key Features to Implement:**
+In summary:
+
+- **Kong** – Handles external exposure, routing, and enforcement of policies (auth, rate limiting, etc.).
+- **OAuth2 Proxy** – Offloads the heavy lifting of user authentication (OAuth login flow with GitHub) and maintains session state via a secure cookie.
+- **Backend API** – Protected behind Kong and OAuth2 Proxy, it receives requests only after they pass through those layers.
 
-- **Authentication & Authorization:** Using JWT tokens (and an OAuth2 Proxy for login flow) to ensure only authenticated users can access the API.
-- **Rate Limiting:** Enforcing call quotas (e.g. 5 requests/minute) to prevent abuse[apipark.com](https://apipark.com/techblog/en/understanding-kong-api-gateway-a-comprehensive-guide-for-beginners-2/#:~:text=* Use Token,and respond to them promptly) and illustrate protection against DDoS or overload.
-- **API Gateway Monitoring:** Logging and tracing requests through Kong (and a mock logging service) and using Postman to verify headers and responses.
-- **Scalability & Modularity:** Using Kubernetes to deploy all components (gateway, auth proxy, backend) and demonstrating how policies can be adjusted without changing the backend.
+Next, we’ll delve into how this is set up in Kubernetes (both locally and on AKS), and then examine each aspect in detail: Kong’s operation and config, the OAuth2 Proxy’s GitHub integration, JWT authentication mechanism, and how we monitor and rate-limit the API.
 
-By the end, we will have a **local API gateway** on Minikube that fronts a backend API, requires valid JWT tokens (or OAuth2 login), limits request rates, and logs traffic – providing a holistic view of API management in practice.
+## Kong in Kubernetes: Deployment on Minikube vs. AKS
 
-## Understanding API Gateways and Plugins
+Kong can operate as a Kubernetes **Ingress Controller**, meaning it dynamically configures itself based on Kubernetes Ingress resources and custom resources. In both Minikube and AKS, we deploy Kong in the cluster to serve as the API gateway. The core behavior is the same, but there are a few differences in setup:
 
-![img](blob:https://chatgpt.com/99f33b7d-258c-4682-86eb-39b6eceb9718) *Figure: A conceptual view of an API Gateway as a central entry point. The gateway handles common concerns (security, transformations, logging, monitoring) for multiple downstream microservices[konghq.com](https://konghq.com/blog/learning-center/what-is-an-api-gateway#:~:text=As organizations adopt microservices architecture%2C,can help address these issues)[descope.com](https://www.descope.com/blog/post/kong-gateway-authentication#:~:text=The Kong Gateway is a,seamless API integration and high).*
+- **Deployment & Ingress Class:** Kong is typically installed via the official Helm chart or YAML manifests. This sets up the **Kong Ingress Controller** (often a Deployment) along with the Kong proxy itself. In Kubernetes, Kong will watch for Ingress resources labeled with a specific class (e.g. `ingressClassName: kong`) and translate them into Kong routes/services internally. In our demo, we create an Ingress resource for the API route(s) we want Kong to handle. Kong’s controller ensures that any Ingress or custom resource (like KongPlugin, KongConsumer) is applied to the running gateway configuration.
+- **Service Type (Exposure):** On **Minikube**, there is no built-in cloud Load Balancer. We often expose Kong via a NodePort service or use Minikube’s tunnel/Ingress addons. For example, Kong’s proxy can be mapped to a localhost port or the Minikube VM’s IP. In our local setup, we might simply port-forward to Kong or use `minikube service` to access it. On **AKS**, Kong is typically exposed with a Service of type `LoadBalancer`, which provisions an Azure Load Balancer IP for external access. This means in AKS, Kong gets a public endpoint (IP or DNS) reachable from the internet from outside). We would configure our DNS or client to call that address. The Ingress resource’s host (e.g. `api.example.com`) can be mapped to this LB.
+- **Environment Configuration:** In both environments, Kong requires some configuration via environment variables or ConfigMap. For instance:
+  - `KONG_DATABASE` can be set to `postgres` or `off` depending on whether we use a database. In a quick demo, **DB-less mode** (declarative config in a ConfigMap) is convenient, but in our described setup we used Kong’s admin API with a database to dynamically add plugins/consumers. Kong supports both approaches. In Minikube, one might use DB-less for simplicity (since everything resets easily), whereas in AKS a Postgres instance (in-cluster or external) could be used for persistence of Kong config across restarts.
+  - `KONG_PROXY_LISTEN` and `KONG_ADMIN_LISTEN` configure Kong’s ports. By default, the proxy listens on 80/8000 (HTTP) and 443/8443 (HTTPS) for client traffic, and the admin API on 8001 (only inside cluster). We typically leave these default. In AKS behind a LoadBalancer, the LB will forward to Kong’s proxy ports.
+  - `KONG_PLUGINS` can list any custom plugins to load. For our needs, the standard plugins (rate-limiting, JWT, etc.) are already bundled with Kong.
+- **Ingress and Routing Configuration:** We define a Kubernetes **Ingress** resource to tell Kong how to route requests. For example, we might create an Ingress for path `/api/` (or a host like `demo.example.com`) that points to the **OAuth2 Proxy service** in the cluster. Kong’s controller will convert this to a Kong **Route** and **Service** internally. The target Service would be OAuth2 Proxy (which itself will forward to the actual backend). We also likely create another Ingress (or an additional path) for the OAuth2 Proxy’s own endpoints (`/oauth2/*`), so that the callbacks and login routes are accessible. In Minikube, our ingress might use a dummy host (or `localhost`) and we rely on port-forwarding; in AKS, we use a real hostname with DNS pointing to the LB.
+- **TLS (HTTPS):** On a local cluster, we might not configure TLS for simplicity (using HTTP and `cookie-secure=false` for OAuth2 Proxy as noted later). On AKS, it’s good practice to use HTTPS. Kong can terminate TLS at the gateway by adding a Kubernetes TLS secret and referencing it in the Ingress. For a classroom demo, this may be an advanced detail, but in a real scenario the GitHub OAuth app would require the redirect URI to match the scheme (http vs https) that the user is redirected to. (For our demo, we used HTTP for ease of setup; in production AKS, we’d use HTTPS and secure cookies).
 
-**What is an API Gateway?** In essence, an API gateway is **middleware** that routes client requests to appropriate services and enforces policies. It acts as **a single entry point** for clients to access one or more microservices. Instead of clients calling services directly, all calls go through the gateway, which can handle **authentication**, **rate limiting**, **data transformation**, caching, load balancing, and more. This indirection simplifies client interactions (the client only talks to the gateway) and centralizes logic like security. Kong Gateway, for example, allows you to manage and secure API traffic with plugins for auth, rate-limit, logging, etc. This architecture improves scalability and security by offloading these concerns from individual services to the gateway layer.
+Despite these differences, **the core behavior remains**: Kong is the first contact for clients, and it routes traffic according to rules, applying plugins for auth and rate limiting as configured. On Minikube, you’ll interact with Kong via a local address, whereas on AKS you’ll have a cloud endpoint – but Kong itself works the same way in both environments.
 
-**Why use plugins?** API Gateways like Kong or Tyk are designed to be extensible via **plugins**. Plugins are modules that execute on each request/response, implementing features such as JWT validation, OAuth2 flows, rate limiting, logging, etc. These can often be toggled or configured per service or route. For instance, Kong’s plugin system allows enabling JWT auth on certain routes, or a global rate-limit plugin for an API, without touching the service’s code. This modular approach means we can add or adjust policies on the fly (via configuration) and achieve **consistent enforcement** across all services.
+## Kong Gateway: Ingress Controller Behavior and Configuration
 
-**JWT vs OAuth2 (OAuth2 Proxy):** We will demonstrate two auth strategies: **JWT authentication** (where a token is issued and verified by the gateway) and **OAuth2 login flows** via an external provider (using an OAuth2 Proxy). JWT (JSON Web Token) is a stateless token format that contains claims (user identity, expiration, etc.) and is signed by a trusted authority. The gateway can verify this signature to authenticate users without querying a database on each request. OAuth2, on the other hand, involves redirecting users to an identity provider (e.g. GitHub or Google) to log in; after login, a token or session cookie is provided, which the gateway (or a proxy component) uses to allow access. In our setup, **OAuth2 Proxy** is a separate component that handles that redirection and token issuance (using GitHub OAuth in our case), then passes an authenticated request to the backend. We will see how Kong can integrate with such a proxy by treating it as an upstream service for authenticated routes.
+Once Kong is running in the cluster, we need to configure it to protect and forward our API. Let’s break down the key **Kong concepts and settings** in this architecture:
 
-**Rate Limiting:** Rate limiting is crucial for **scalability and reliability**. It ensures no single client can overwhelm the API by capping the number of requests allowed in a time window. Gateways often implement this via plugins (Kong’s `rate-limiting` plugin) which can track request counts per consumer or globally, and reject requests with `HTTP 429 Too Many Requests` once limits are exceeded. This protects the backend from abuse and smooths out traffic spikes.
+- **Routes and Services:** In Kong’s model, a **Service** object represents an upstream API (an internal backend URL), and a **Route** object maps client requests to that service based on criteria (path, host, etc.). In our setup, one Service will correspond to the OAuth2 Proxy (since all traffic goes through it), and the Route will match the desired paths (e.g. `/api/hello` and OAuth2 Proxy’s own `/oauth2/` URLs). For example, we might configure a Route with path `/api/` that maps to the Service pointing at `oauth2-proxy:4180` (assuming the OAuth2 Proxy service is on port 4180). Kong will then forward any requests starting with `/api` to the OAuth2 Proxy. Kong can strip path prefixes or pass them as-is; in this case we likely keep the path so OAuth2 Proxy knows what downstream path to request. *(If we had multiple distinct backend services, we could define multiple Services/Routes, but in this demo the OAuth2 Proxy fronts the single Flask API.)*
+- **Plugins (Auth, Rate Limiting, etc.):** Kong **Plugins** are modular policies we can enable on a global, service, or route level. Major plugins used in this architecture:
+  - **Rate Limiting Plugin:** We apply rate limiting to protect the API from abuse or accidental overload. For example, a global or route-specific rate limit might allow, say, 5 requests per minute from a client. In Kong, this is configured with plugin settings like `config.minute=5` and a `config.policy` for how counters are stored. Using `policy=local` means the counter is in-memory per Kong node (fine for a single-node demo)file-vlrsohrq3l3b3xhshqpdxufile-vlrsohrq3l3b3xhshqpdxu, whereas `policy=cluster` would use the database, or `redis` could use an external Redis for synchronized counters across multiple gateway pods. When the limit is exceeded, Kong responds with **HTTP 429 Too Many Requests**, including headers like `X-RateLimit-Limit` and `X-RateLimit-Remaining` to inform the client of the quotafile-vlrsohrq3l3b3xhshqpdxu. In our demo, Kong would enforce this limit regardless of who the user is (unless we scope it per consumer; more on that below).
+  - **JWT Authentication Plugin:** Kong’s **JWT plugin** can verify JSON Web Tokens on inbound requests. If a client presents a valid JWT (in the Authorization header, cookie, or query param), Kong will cryptographically verify the token’s signature (supporting HS256 and RS256 algorithms by default). If the token is valid (and not expired), Kong allows the request through; if not, it returns a **401 Unauthorized**. Kong’s JWT plugin requires setting up **credentials** (public keys or shared secrets) associated with **Consumers** (representing API clients or users). For example, we could create a Kong Consumer for each user or client application, and provision a JWT credential (with a secret or RSA public key) for them. The JWT plugin then knows how to validate that consumer’s tokens. In this demo, however, we opted to handle authentication via OAuth2 Proxy (with cookies), so we did **not** enable Kong’s JWT plugin for the protected route. (We will discuss combining OAuth2 Proxy and JWT later.)
+  - **Key Authentication (API keys)**, **Basic Auth**, etc.: Kong also offers other auth plugins (key-auth, basic-auth, OAuth2 plugin, etc.), but we focus on JWT and the external OAuth2 Proxy approach here. (For reference, Kong’s OAuth2 plugin can issue OAuth tokens itself, but that is more complex and not used since we leverage GitHub OAuth via OAuth2 Proxy.)
+- **Consumers:** A **Consumer** in Kong is an entity representing an API consumer (a user or client app). Consumers are often used in conjunction with auth plugins to tie requests to a known identity. For instance, when using the JWT plugin, each token is associated with a Consumer (by embedding the consumer’s credential key/ID in the JWT claims or via the credential used to sign it). In our architecture, since we bypass Kong’s native auth in favor of OAuth2 Proxy, Kong does not automatically know the end-user’s identity – it just sees traffic coming from OAuth2 Proxy as the “upstream”. We could still create a Consumer to represent “authenticated users” and use Kong’s **auth** plugins or logging for that user, but by default Kong won’t map the OAuth2 Proxy session to a Kong Consumer. In our demo steps, we created a Consumer largely for demonstration and logging purposes (and it would be required if we later wanted to attach per-consumer rate limits or use the JWT plugin)file-vlrsohrq3l3b3xhshqpdxu. In practice, when using an external auth proxy, the per-user logic is often handled outside Kong. However, Kong’s consumer concept could be leveraged if we, say, passed a JWT (with user info) that Kong can validate – then Kong could treat each user as a Consumer (with a token mapping). This wasn’t done in our simple setup.
+- **Kong as an Ingress Gateway:** Operating inside Kubernetes, Kong’s ingress controller will automatically translate K8s resources:
+  - An Ingress with host/path becomes a Kong Route and Service.
+  - We can attach plugins to Ingresses via annotations or by referencing KongPlugin CRDs. For example, adding an annotation `konghq.com/plugins: <plugin-name>` on an Ingress will apply that plugin on the route. In our case, we could define a `KongPlugin` CRD for rate-limiting (and another for JWT auth if used) and then attach it to the Ingress for the API route. This way, Kong knows to enforce those plugins on that route. (Alternatively, with DB-mode Kong, we could use the Admin API or declarative config to configure the plugins – our demo used the Admin API to add them post-deployment for illustration.)
+  - The Kong ingress controller also defines CRDs like `KongIngress` for advanced routing config (e.g., methods allowed, custom timeouts) and `KongConsumer` as mentioned. We kept things relatively standard, relying on basic Ingress definitions.
 
-**Kong vs Tyk:** Both Kong and Tyk are popular open-source API gateways with similar capabilities (auth, rate limiting, transformation, monitoring). In our demo we use **Kong OSS** for hands-on configuration, but the concepts (deploying a gateway in front of services, applying plugins) would be analogous in Tyk. Kong provides an Admin API and declarative config; Tyk has a dashboard and config files – either could be used for a local demo. (If time permits, we could note differences or why Kong was chosen – e.g., large community and plugin ecosystem.)
+In summary, **Kong inside Kubernetes** acts as both the ingress (replacing something like Nginx ingress) and the API gateway. It listens on the cluster’s external interface for requests, matches them to configured routes, and applies plugins (rate limiting, auth) and then forwards to the appropriate service (OAuth2 Proxy or directly to backend as configured). For our demo, Kong’s key configuration included setting up the route to point to OAuth2 Proxy, enabling rate limiting on that route, and ensuring Kong was aware of (or ignoring) auth as needed. Kong provides a central point to monitor and adjust these rules for both local and AKS deployments.
 
-## Technology Stack and Tools
+## OAuth2 Proxy for GitHub Authentication
 
-Our demo stack consists of the following components (all running locally on Minikube):
+To handle user authentication, we integrate **OAuth2 Proxy** into this architecture. OAuth2 Proxy (oauth2-proxy) is a lightweight reverse proxy that handles the OAuth 2.0/OpenID Connect login flow with an Identity Provider – in our case, GitHub. It allows us to protect web services by requiring login via an external provider (GitHub) without modifying the backend service. Here’s how it works and how we configure it:
 
-- **Kong Gateway (Open-Source edition):** API gateway enforcing auth and rate limiting policies. Deployed via the official Helm chart.
-- **OAuth2 Proxy:** An open-source OAuth2 proxy (configured for GitHub OAuth) that runs behind Kong to handle user login and issue JWT cookies. It adds an authentication layer by integrating with an external Identity Provider (IdP).
-- **Backend API:** A simple Flask application (Python) providing a demo endpoint (`/api/hello`). This simulates our protected microservice. It’s containerized with Docker.
-- **Kubernetes (Minikube):** Used to orchestrate the above components. Minikube provides a local K8s cluster; we use it to deploy the backend API, Kong, and OAuth2 Proxy as pods/services.
-- **Postman & cURL:** Tools for testing the API from a client perspective. Postman will be used in the demo to simulate requests, present headers, and demonstrate the effect of auth and rate limits. cURL (or PowerShell `curl.exe`) is used in setup steps (especially to configure Kong via its Admin API).
-- **Helm & kubectl:** Helm is used to install Kong on K8s easily, and `kubectl` to manage resources (deployments, services, etc.).
+- **Placement and Role in Flow:** In our cluster, OAuth2 Proxy runs as a separate Deployment (with a ClusterIP Service). Kong is configured to route API requests to OAuth2 Proxy, effectively interposing it between clients and the backend API. When a user makes a request to the API (through Kong), they are actually talking to OAuth2 Proxy first. OAuth2 Proxy will *authenticate* the request and then forward it to the real backend if the user is logged in. If not logged in, OAuth2 Proxy **initiates the GitHub OAuth flow**: it responds with a redirect to GitHub’s authorization URL. This redirect goes back through Kong to the user’s browser (or client). For a web browser user, this means you suddenly get GitHub’s login page.
+- **GitHub OAuth2 Flow:** We have registered an OAuth application in GitHub (providing a Client ID and Client Secret). The OAuth2 Proxy is configured with those credentials. Key settings in the **OAuth2 Proxy config** (often done via command-line args or environment variables):
+  - `--provider=github` tells OAuth2 Proxy to use GitHub as the OAuth provider. It knows GitHub’s OAuth endpoints (authorize and token URLs).
+  - `--client-id` and `--client-secret` (or corresponding environment vars) are set to the values from our GitHub OAuth app. These allow OAuth2 Proxy to act as an OAuth client for authentication.
+  - `--redirect-url` is the URL where GitHub will send the user back after successful auth. In our local demo, we used `http://localhost:4180/oauth2/callback`file-vlrsohrq3l3b3xhshqpdxu because we accessed OAuth2 Proxy directly on that port. In a production/AKS scenario, this would be something like `https://<my-domain>/oauth2/callback` (which Kong would route to the proxy). It must match exactly what’s registered in GitHub. This URL is essentially an endpoint on OAuth2 Proxy that completes the OAuth handshake.
+  - `--cookie-secret` is a random secret string used by OAuth2 Proxy to encrypt its session cookiefile-vlrsohrq3l3b3xhshqpdxu. After a user logs in via GitHub, OAuth2 Proxy creates a session (to avoid needing to go to GitHub for every request). It stores session info (including tokens or identity info) in a secure cookie. The cookie is encrypted/signed with this secret so that it can’t be tampered with. In our demo, we provided a dummy secret (e.g., a 32-byte base64 string) for testing.
+  - `--cookie-name` (optional) can set a custom name for the session cookie (default is something like `_oauth2_proxy`).
+  - `--cookie-secure` flag: we set this to `false` in local testing so that the cookie can be transmitted over plain HTTPfile-vlrsohrq3l3b3xhshqpdxu. In AKS with TLS, we’d set it to true to ensure the cookie is only sent over HTTPS.
+  - `--cookie-domain` or `--cookie-path`: not strictly needed unless we want to scope the cookie. If Kong and OAuth2 Proxy are on the same root domain, we ensure the cookie domain covers our app’s domain.
+  - `--email-domain` or GitHub org/team restrictions: OAuth2 Proxy can restrict who can log in. For example, `--github-org=myOrg` could ensure only members of *myOrg* on GitHub are allowed. In a classroom demo, we might skip this, allowing any GitHub user, or limit by email domain if using Google, etc.
+  - `--upstream` is used to specify the final upstream service that OAuth2 Proxy should forward to after auth. In our case, `--upstream=http://flask-api:80/` (the internal URL of our Flask service) would be set. This means OAuth2 Proxy, after verifying the user, will proxy the request to that upstream. We can have multiple upstreams or use it as a catch-all. In the config file `oauth2-proxy.cfg`, we likely define the upstream and other settings.
+  - `--http-address=0.0.0.0:4180` simply tells it which port to listen on (4180 in our case, the default).
+- **Headers and Cookies Passed to Backend:** Once a user successfully authenticates via GitHub (OAuth2 Proxy receives a valid OAuth authorization code, exchanges it for an access token and possibly an ID token from GitHub), it will establish a session. The default mode is that OAuth2 Proxy will set a cookie in the user’s browser to track the session. For each subsequent request, the browser sends this cookie, and OAuth2 Proxy knows the user is already logged in (it decrypts the cookie to get the session details). Now, when proxying the request to the backend API, OAuth2 Proxy adds helpful headers with the user’s identity:
+  - `X-Forwarded-User` – the username or login of the user (for GitHub, this would be their GitHub username).
+  - `X-Forwarded-Email` – the user’s email address (if available from the OAuth scope).
+  - `X-Forwarded-Preferred-Username` or other OIDC claims depending on provider.
+  - `Authorization` header – **if** we enable the option `--set-authorization-header=true`, OAuth2 Proxy will pass the OAuth access token in an `Authorization: Bearer <token>` header to the backendfile-vlrsohrq3l3b3xhshqpdxu. In our config, we did set this. With GitHub as the provider, this token is the GitHub API token (not a JWT). This could be useful if the backend wants to call the GitHub API on the user’s behalf or validate their org membership, etc. If the provider were OpenID Connect (like Google), this could also be a JWT ID token.
+  - We also enabled `--pass-access-token` or similar in some setups to forward the raw token separately, but the authorization header already covers that. (There are related flags like `--pass-basic-auth`, `--pass-user-headers` which control what info is forwarded. By default, OAuth2 Proxy will pass X-Forwarded-* headers for user and email.)
 
-Additionally, for monitoring/logging demonstration, we use **httpbin** (via a `mock-logger` service) to collect request logs from Kong’s logging plugin, and the **Kong Admin API** for any runtime configuration changes.
+Our Flask backend is written to read these headers. For example, it might do: `user = request.headers.get("X-Forwarded-User")` and then include that in the response. In fact, our demo’s Flask app returns a JSON with the `"user"` and `"email"` it sees in the headersfile-vlrsohrq3l3b3xhshqpdxu. When everything is set up, after logging in, a request to `/api/hello` might return something like: `{"message": "Hello from backend API", "user": "octocat", "email": "octocat@github.com"}` – confirming that the OAuth2 Proxy successfully authenticated the user and injected their identity.
 
-With this stack, we’ll walk through deploying each piece and verifying that the end-to-end system meets our goals: the user must authenticate (JWT or OAuth2) and is subject to rate limits, and the gateway will log and proxy the request to the backend service.
+- **OAuth2 Proxy Integration with Kong:** There are a couple of ways Kong and OAuth2 Proxy integrate:
+  1. **Routing integration:** As mentioned, Kong simply routes certain paths to the OAuth2 Proxy service. For example, Kong can route all `/oauth2/*` URLs to OAuth2 Proxy (for the login, callback, and auth endpoints), as well as the main `/api/*` to OAuth2 Proxy. Essentially Kong is oblivious to the auth flow; it’s just forwarding the requests to the correct internal service. This is straightforward: we set up Ingress or Kong Routes such that:
+     - `^/oauth2/` -> OAuth2 Proxy service (this covers `/oauth2/start` (the login initializer), `/oauth2/callback` (GitHub redirect hits this), and `/oauth2/auth` (used in Nginx auth_request setups), etc.).
+     - `^/api/` -> OAuth2 Proxy service (which internally will forward to actual API if authenticated).
+        Kong doesn’t need any special plugin in this case – it’s just passing through. The downside is Kong doesn’t itself know if a user is authorized or not, it relies entirely on OAuth2 Proxy to allow or deny requests (OAuth2 Proxy will only forward to upstream if session is valid; if not, it returns a 403 or redirect).
+  2. **(Alternative) External auth plugin:** Some API gateways support an external auth hook. Kong open-source doesn’t have a direct equivalent of Nginx’s `auth_request` out of the box (though Kong Enterprise has an OpenID Connect plugin, and one could write a custom plugin). In our case, we did not use a Kong plugin for OIDC; we simply used routing as above. (There are community plugins or the Curity “Kong OAuth Proxy” plugin that can decrypt the cookie and validate tokens at the gateway, but those are beyond our scope.)
+- **User Experience:** Putting it together, the first time a user tries to access the API:
+  - They call the API URL -> Kong -> OAuth2 Proxy.
+  - OAuth2 Proxy sees no session cookie and replies (via Kong) with a **302 Redirect** to GitHub’s OAuth site. (If using Postman, you would catch this redirect; in a browser, it happens automatically.)
+  - The user logs into GitHub and approves the OAuth request. GitHub then redirects back to our `oauth2/callback` endpoint (which travels to Kong and then to OAuth2 Proxy).
+  - OAuth2 Proxy validates the GitHub response, creates a session cookie, and then usually redirects the user to the original URL they wanted (this is handled via a query param `?rd=<original_url>` in the initial redirect).
+  - The user’s browser, now with the session cookie set, makes the request again (or is automatically redirected) to the original API endpoint. This time, OAuth2 Proxy finds the valid cookie, so it forwards the request to the Flask API, adding `X-Forwarded-User` etc.
+  - The backend returns the content, which goes back to the user. From this point on, as long as the session cookie is valid, the user can call the API and OAuth2 Proxy will directly forward the requests (no more GitHub redirects) – essentially single sign-on for the session duration.
+- **Session Duration and Refresh:** By default, the cookie might last some hours. There are options like `--cookie-refresh` to periodically force a re-check with the IdP, or `--cookie-expire`. We won’t dive deep here, but know that eventually the user might need to re-login after expiry.
 
-## Architecture Diagram and Flow
+The **major OAuth2 Proxy configuration settings** we covered (and their purpose) can be summarized:
 
-![img](blob:https://chatgpt.com/74b137e3-7a96-4670-8948-b1a8f72cf54f) *Figure: High-level request flow in our demo architecture. Kong Gateway sits in front of the OAuth2 Proxy and Flask API. If a user is not authenticated, the OAuth2 Proxy triggers a login (dashed lines show the redirect flow to an external IdP like GitHub). Once authenticated (user returns with an auth code/cookie), Kong proxies the API call to the OAuth2 Proxy, which forwards it to the backend service. Kong’s plugins (e.g., JWT auth, rate limiting) can be applied on the path before the request reaches the backend.*
+- `--provider`, `--client-id`, `--client-secret` – define the OAuth provider and credentials (GitHub OAuth app info).
+- `--redirect-url` – where to return after login (must match app and route to the proxy).
+- `--upstream` – the backend API endpoint(s) to forward to after auth.
+- Session cookie settings (`--cookie-secret`, name, secure flag, domain) – secure persistence of login state.
+- Headers to pass (`--set-authorization-header`, `--pass-*` flags) – how user info or tokens are forwarded to upstream.
+- Allowed users (`--github-org`/`--email-domain` etc.) – to restrict access if desired.
 
-The architecture can be thought of in layers:
+## JWT Authentication: Signing and Validation Basics
 
-- **Client (User/Postman):** Initiates requests to the API endpoint (e.g., `GET /api/hello`). In a browser scenario, if not logged in, the user would be redirected to an OAuth2 provider (GitHub) to authenticate.
-- **Kong API Gateway:** The first point of contact for API requests. Kong will check if the request matches a defined route and then apply configured plugins. For example:
-  - **JWT Auth Plugin:** If enabled, Kong will require a valid JWT in the `Authorization` header and verify it (using a public key for the issuer). If the token is missing or invalid, Kong immediately responds with `401 Unauthorized`.
-  - **Rate Limiting Plugin:** Kong will count the request (per route or per consumer) and potentially throttle if the limit is exceeded (returning `429 Too Many Requests`).
-  - If the request passes all plugin checks, Kong routes it to the appropriate upstream service.
-- **OAuth2 Proxy (Upstream Service 1):** This acts as an authentication layer in the OAuth2 flow. Kong can be configured to route certain requests (e.g., any request to the protected API path) to the OAuth2 Proxy first. The proxy checks for a valid session cookie:
-  - If the user is not authenticated, the proxy **redirects** the user to the OAuth2 provider’s consent page (GitHub OAuth). After the user logs in and approves, the provider redirects back to the proxy with an auth code, and the proxy then obtains an ID token or sets a session cookie. (This redirect loop is shown with dashed arrows in the figure.)
-  - Once the user has a valid session, the OAuth2 Proxy forwards the request to the actual backend service, adding **headers** like `X-Forwarded-User` and `X-Forwarded-Email` to convey the user’s identity.
-- **Flask API (Upstream Service 2):** The final destination that handles the request (if authentication and rate checks passed). In our demo, this is a simple Flask app that responds with a JSON greeting and echoes back the `X-Forwarded-User/Email` it received in the request headers. It is oblivious to the gateway’s presence – it just sees incoming requests (the gateway and proxy ensure those requests are from authenticated, allowed users).
+While our demo uses OAuth2 Proxy with cookies for authentication, it’s important to understand **JWT (JSON Web Token) authentication** since Kong and Tyk both support it, and it’s a common method for API auth. Here’s a brief overview of JWT and how Kong deals with JWTs:
 
-**Architecture summary:** The user’s request goes to Kong → Kong enforces auth (JWT or via OAuth2 Proxy) and rate limiting → the request is passed to Flask API → response goes back to the client. This setup emulates a **zero-trust environment** where the gateway strictly checks credentials and usage, giving the backend confidence that incoming traffic is safe and within expected volumes.
+- **What is a JWT?** JSON Web Token (RFC 7519) is a compact, URL-safe means of representing claims between two parties. A JWT typically has three parts: a header, a payload, and a signature – encoded as Base64URL and joined by dots. For example: `header.payload.signature`. The header specifies the signing algorithm (e.g. `alg: HS256` or `RS256`) and token type. The payload contains claims like issuer (`iss`), subject (`sub`), audience (`aud`), expiration time (`exp`), etc. The signature is generated by signing the header and payload (usually with a secret key for HS256 or a private key for RS256).
 
-## Step 1: Building the Backend API (Flask)
+- **Signing and Validation:** To “sign” a JWT, if using HMAC (HS256), the issuer uses a shared secret key. If using RSA/ECDSA (RS256, ES256), the issuer uses a private key. The signature ensures integrity – if the token is tampered with, verification fails. **Validation** of a JWT involves:
 
-The first component is the **backend API**, a simple Flask application that we’ll protect behind the gateway. This API has a couple of endpoints:
+  1. Parsing the token and base64-decoding the parts.
+  2. Checking the header to see what algorithm was used and perhaps a key ID (`kid`).
+  3. Using the expected secret or public key to verify the signature against the header+payload. If this cryptographic check passes, the token is proven to be issued by a trusted party (assuming only the trusted issuer knows the secret or private key).
+  4. Checking token claims for validity: e.g., ensure `exp` (expiry time) is in the future, `nbf` (not before) is in the past, and that audience or issuer matches what we expect. Kong’s JWT plugin, for instance, will reject tokens that are expired or not yet valid, and can be configured with acceptable issuers/audiences.
+  5. If all checks pass, the token is considered **authenticated** and the claims can be trusted in handling authorization.
 
-- `GET /api/hello` – returns a JSON message, e.g. `{ "message": "Hello from backend API" }`. It also includes user info from headers if present (e.g. it will read `X-Forwarded-User` and `X-Forwarded-Email` headers set by the auth proxy and include them in the response).
-- `GET /` (root) – optional health-check or OAuth2 Proxy check endpoint, which can confirm the OAuth2 Proxy is working by echoing the forwarded user info as well.
+- **JWT Use in API Gateways:** The idea is that a user or client can obtain a JWT from an identity provider or auth server (e.g., via an OAuth2 authorization server, or some login service), then present that JWT on each request (usually in the `Authorization: Bearer <token>` header). The API gateway can validate the JWT on each request without needing to call back to the auth server (this is **stateless auth**). This is efficient and scalable: the gateway uses the public key or secret to verify the token and doesn’t need to store session state. JWTs are widely used for microservice auth because of this property. It’s important to use strong signing algorithms (asymmetric RSA/EC recommended over HS256 shared secrets in many cases).
 
-For example, the Flask code for `/api/hello` might look like this (simplified):
+- **Kong’s JWT Plugin Mechanics:** As noted earlier, Kong’s JWT plugin lets you declare one or more secrets or public keys for a Consumer, effectively declaring “this is how to verify tokens for this consumer.” When a request with a JWT comes in, Kong looks for the token in either:
 
-```
-pythonCopyEdit@app.route("/api/hello")
-def hello():
-    return jsonify({
-        "message": "Hello from backend API",
-        "user": request.headers.get("X-Forwarded-User"),
-        "email": request.headers.get("X-Forwarded-Email")
-    })
-```
+  - The `Authorization` header (with schema Bearer by default),
+  - A query parameter (if configured to allow, e.g. `?jwt=<token>`),
+  - Or a cookie (if configured). By default, it checks header and query param names.
 
-This ensures that if the request passes through the OAuth2 Proxy with an authenticated session, the backend can see who the user is. (If the headers are missing, it likely means the request was unauthenticated.) The Flask app listens on port 5000.
+  Kong then tries each known key (the plugin maintains a list of keys associated with all Consumers) to verify the token’s signature. If one matches and verification passes, Kong knows which Consumer this token belongs to (because the credential used is tied to a Consumer). Kong can then inject headers to the upstream like `X-Consumer-Username` or `X-Consumer-Id` if needed, and apply any Consumer-specific plugins (like a rate limit per user). If verification fails or no token is provided when required, Kong returns `401 Unauthorized`. If multiple tokens are accidentally present (say in both header and query), Kong will reject the request to prevent ambiguity.
 
-After writing the Flask app (`app.py`), we create a **Dockerfile** to containerize it. The Dockerfile is straightforward:
+- **JWT in Our Demo Context:** We initially considered using Kong’s JWT plugin for auth, which would involve issuing JWTs to clients after they log in. For example, we could have had OAuth2 Proxy (or a custom step) mint a JWT for the user and have the client use that on subsequent calls. However, to keep things simpler, we relied on OAuth2 Proxy’s session cookie mechanism. JWT authentication is **not** directly used in the current flow (the access token from GitHub isn’t a JWT). We **skipped Kong’s JWT plugin** because OAuth2 Proxy already ensures the user is authenticated via cookie, and Kong isn’t inspecting that cookie by default.
 
-```
-dockerfileCopyEditFROM python:3.9
-WORKDIR /app
-COPY app.py .
-RUN pip install flask
-EXPOSE 5000
-CMD ["python", "app.py"]
-```
+However, it’s worth noting that if we used a provider like Google or Azure AD via OAuth2 Proxy, we might get an **ID Token JWT** in addition to an access token. In such a case, one could configure OAuth2 Proxy with `--set-authorization-header=true` to pass the JWT to Kong, and Kong’s JWT plugin (if configured with the correct Google public keys) could validate that on each request. This would be a form of defense-in-depth (Kong double-checks the token) but also somewhat redundant since OAuth2 Proxy already did the auth. More typically, you’d choose one approach: *either* have the gateway do JWT verification, *or* have an oauth2-proxy in front that manages login and sessions.
 
-We then build the Docker image and push it to Docker Hub (so Minikube can pull it). Steps:
+## Combining JWT and OAuth2 Proxy with Kong – Can They Work Together?
 
-1. **Build the image:** `docker build -t <your-dockerhub-username>/backend-api:latest .` (run in the `backend/` directory containing the Dockerfile).
-2. **Test locally (optional):** You can run the container with `docker run -p 5000:5000 ...` to verify it serves the `/api/hello` endpoint.
-3. **Push to Docker Hub:** `docker push <username>/backend-api:latest` and ensure the image is accessible (you should see it in your Docker Hub repository).
+Given we have two authentication mechanisms (JWT auth and OAuth2 Proxy OAuth), a natural question is whether we should (or can) use them simultaneously with Kong. The answer depends on the use case, but generally they are used **alternatively** rather than fully together:
 
-Once the image is available, we move to deploying it on Kubernetes.
+- **Either/Or Use Case:** In many scenarios, you would pick one approach. For instance:
+  - If you have an SPA or mobile app that can handle tokens, you might use a pure JWT approach: The client gets a JWT from an identity service and then calls Kong directly with that token on each request. Kong’s JWT plugin secures the API in this case (no OAuth2 Proxy needed).
+  - If you have web applications or need to leverage a third-party OAuth provider for login, using OAuth2 Proxy is convenient. It handles the user redirections and issues a session cookie. In this case the client (browser) isn’t sending a JWT on each request, it’s sending the cookie. Kong cannot validate that cookie itself (it doesn’t know how to decrypt it), so Kong must delegate auth to the proxy. Kong then doesn’t need its JWT plugin for that route.
+- **Using Both for Different Clients:** It is possible to have a hybrid: for example, you might protect some routes with OAuth2 Proxy (for interactive user access via browser) and other routes with JWTs (for API-to-API communication or mobile clients). Kong could be configured with both, but you’d likely separate the paths or hosts. For instance, requests coming from a single-page app might include a JWT that Kong validates, whereas your web portal uses cookies. Combining these on the same route is tricky because Kong’s JWT plugin doesn’t know about the cookie from OAuth2 Proxy. One could conceive a scenario where after OAuth2 Proxy login, the proxy issues a JWT to the client (instead of or in addition to a cookie) and then Kong’s JWT plugin checks it. But that would require custom work (issuing JWTs in OAuth2 Proxy isn’t a standard feature unless the IdP provides one).
+- **Chaining OAuth2 Proxy with Kong JWT:** If an identity provider provided JWTs, Kong could validate them. For example, if we used an OIDC provider that gives a JWT access token, and we set `--pass-access-token` and `--set-authorization-header`, the backend (or Kong) would see `Authorization: Bearer <JWT>`. We could then enable Kong’s JWT plugin on that route with the provider’s public key configured. Kong would then independently verify the JWT on every request, acting as a second layer. This ensures that even if someone bypassed OAuth2 Proxy (which is unlikely if network rules are set correctly) or if the token was stolen, Kong would still enforce validity. But in practice, since the OAuth2 Proxy is already in path, this duplication is usually unnecessary. Instead, one would rely on *either* the proxy’s session or have the proxy do the heavy lifting and just trust it.
+- **Session vs Stateless:** OAuth2 Proxy by default uses **stateful sessions** (cookie with an encrypted blob or a session stored in an external store like Redis). JWT is stateless. Some prefer JWTs for their statelessness, but managing JWT issuance (refresh, revocation, etc.) can be complex too. OAuth2 Proxy gives a simple stateful model (with cookie refresh, you can logout by cookie invalidation, etc.). For internal APIs, stateless JWT auth is very popular. For user-facing web, OAuth2 Proxy is often simpler.
+- **Kong’s OAuth2 Plugin or OIDC (Enterprise):** It’s worth noting Kong has its own OAuth2 authentication plugin and an OpenID Connect plugin (the latter in Kong Enterprise) which can handle the full login flow or token introspection. Those could eliminate the need for a separate OAuth2 Proxy, by having Kong directly interact with OAuth providers (like Cognito, Okta, etc.). In the open-source Kong, the JWT plugin plus an external identity provider is the common solution (with pre-issued JWTs). OAuth2 Proxy is effectively doing something similar externally.
 
-## Step 2: Deploying the Backend API on Minikube
+**Bottom line:** In our demo, we chose **OAuth2 Proxy + Kong** and did not use JWT plugin concurrently, because the OAuth2 Proxy’s cookie-based auth was sufficient and easier for interactive login. We **could** enhance it by issuing a JWT to the client after login and having Kong validate it – but that would complicate the demo without much added benefit. For API-only clients (like test scripts or other services calling the API), one approach is to allow both cookie or JWT: e.g., if a request has a valid JWT, accept it; otherwise, if it has a session cookie, that’s fine too. Kong doesn’t support a plugin configuration like “JWT or cookie” out of the box (that logic would be custom), so often you’d run separate endpoints or an either-or check in the application layer.
 
-With the container ready, we deploy the Flask API in Minikube using a Kubernetes **Deployment** and **Service**. The Deployment will run one replica of our backend API pod, and the Service will expose it internally so that other services (like Kong or OAuth2 Proxy) can reach it.
+To directly answer whether JWT and OAuth2 Proxy can be used **together** with Kong: **Yes**, but typically by dividing responsibility. OAuth2 Proxy can handle user login and then perhaps issue a JWT that Kong will honor for subsequent API calls. Without custom plugins, though, Kong can’t decrypt OAuth2 Proxy’s cookie on its own. So usually it’s one after the other (as we did: Kong passes to Proxy, Proxy authenticates then calls API). For most use-cases, using one mechanism at a time is sufficient – and adding both can be redundant. Our team chose to prioritize the OAuth2 Proxy approach for user-facing auth, and skip JWT in Kong for simplicityfile-vlrsohrq3l3b3xhshqpdxu.
 
-Key parts of the Kubernetes manifest (YAML):
+## API Protection: Rate Limiting, Tracing, and Monitoring
 
-- **Deployment:**
-  - Uses the Docker image we pushed (`your-dockerhub-username/backend-api:latest`).
-  - Container listens on port 5000.
-  - We can start with 1 replica (this can be scaled later to test load balancing if desired).
-- **Service:**
-  - Exposes port 80 internally and forwards to the pod’s port 5000.
-  - Labeled so that Kong or other cluster components can discover it by name (`backend-api.default.svc.cluster.local` will resolve to this service).
+Protecting an API is not only about authenticating users – it also involves controlling usage (rate limiting) and observing traffic (monitoring and tracing requests). Kong, as the gateway, provides capabilities for both, and Postman is used as a tool to test and demonstrate these features.
 
-Apply the manifest using `kubectl apply -f backend-api/deployment.yaml`. After deployment, verify the pod is running: `kubectl get pods` should show the backend-api pod in `Running` state.
+### Rate Limiting in Kong
 
-To test the backend in the cluster, we have a few options. Since it’s not (and need not be) exposed externally right now, one way is to use `kubectl port-forward` or temporarily expose it via NodePort:
+Rate limiting is crucial to prevent abuse (like a client flooding the API with requests). We configured Kong’s **Rate Limiting plugin** on our API route. The configuration we used was a simple **fixed window limit** of 5 requests per minute per client (global limit)file-vlrsohrq3l3b3xhshqpdxu. Let’s clarify how this works:
 
-- **Port-forward method:** `kubectl port-forward svc/backend-api 5000:80` – then on your localhost you can call `http://localhost:5000/api/hello`. It should return `{"message": "Hello from backend API", ...}`. (At this stage, `user` and `email` will likely be `null` because we aren’t sending those headers yet.)
-- **Minikube service method:** Alternatively, you could use `minikube service backend-api --url` to get a URL for the service, but since this is a ClusterIP service by default (internal), you might first need to change it to NodePort. In practice, we will not directly expose the backend externally – the gateway will be the entry point – so direct testing can be limited to confirming the pod works.
+- By default, without a Consumer or credential to distinguish clients, Kong’s rate limit plugin will use the client’s IP address to track limits (or it can be configured to use a specific header like an API key or the Consumer identifier). In our local test, calling from Postman/cURL, it’s all from one client anyway.
 
-✅ **Verification:** Once you see the **Hello** message from the backend API via one of these methods, you know the Flask service is up and running inside Minikube. We’re ready to introduce the gateway in front of it.
+- The plugin tracks how many requests have been made in the current minute window. Kong adds HTTP headers to each response: `X-RateLimit-Limit-minute: 5` and `X-RateLimit-Remaining-minute: N` to let the client know the limit and remaining callsfile-vlrsohrq3l3b3xhshqpdxu. We observed these in Postman responses. On the 6th request within a minute, Kong responded with **HTTP 429 Too Many Requests**, indicating the limit was exceededfile-vlrsohrq3l3b3xhshqpdxu.
 
-*(Note: In the final architecture, the backend’s \*only\* exposure will be through Kong, which will call it via the internal ClusterIP service. The backend itself won’t be reachable from outside the cluster – a principle of secure design.)*
+- We set `config.policy=local`, meaning the counter is node-localfile-vlrsohrq3l3b3xhshqpdxu. For a single Kong instance, that’s fine. In a multi-node AKS deployment of Kong, if we wanted a unified counter, we could use `policy=cluster` (which in Kong with a DB will use the shared datastore to count) or `policy=redis` to use an external Redis. Kong supports very flexible rate-limit strategies (even leaky bucket algorithms).
 
-## Step 3: Installing Kong API Gateway on Kubernetes
+- The rate limiting plugin can also be applied **per consumer**. If we had the JWT plugin or key-auth identifying consumers, we could enforce, say, “5 requests/minute per user”. In our case, since we didn’t have Kong identify each end-user, we kept it global or per IP. However, if we wanted to ensure each logged-in user can make 5 requests/minute, we’d need Kong to recognize the user – which we could do if the user had a token or if we wrote a custom plugin to treat the `X-Forwarded-User` as a key. That’s an advanced scenario and wasn’t implemented. Instead, the demo just shows a generic protection.
 
-Now we deploy the **Kong API Gateway** in the cluster. We’ll use Helm for a quick setup. Kong’s Helm chart allows installing either DB-less mode or with a database (PostgreSQL). For our needs, we plan to dynamically configure routes and plugins via the Admin API, which works best in database-backed mode (so that configs can be added on the fly). We will install Kong along with a PostgreSQL sub-chart.
+- In terms of configuration, applying the plugin in Kubernetes can be done by a declarative YAML (KongPlugin resource) as shown below (conceptually):
 
-**Helm install:** Use the official chart repository. For example:
-
-```
-bashCopyEdithelm repo add kong https://charts.konghq.com
-helm repo update
-```
-
-Then install Kong with a PostgreSQL database and enable the Admin and Proxy on NodePorts (so we can reach them from our host machine):
-
-```
-bashCopyEdithelm install kong kong/kong --create-namespace -n kong \
-  --set postgresql.enabled=true \
-  --set postgresql.auth.username=kong \
-  --set postgresql.auth.password=kongpass \
-  --set postgresql.auth.database=kong \
-  --set env.database=postgres \
-  --set env.pg_user=kong,env.pg_password=kongpass,env.pg_database=kong \
-  --set admin.enabled=true --set admin.type=NodePort \
-  --set proxy.type=NodePort \
-  --set ingressController.enabled=false \
-  --wait --timeout 5m
-```
-
-Let’s break down some of these settings:
-
-- We enable the **PostgreSQL** database (with a simple username/password) and tell Kong to use it (`env.database=postgres` etc.). This puts Kong in traditional (database-backed) mode rather than the default DB-less.
-- We enable the **Admin API** and set it to NodePort. The Admin API is Kong’s management API (by default it’s on port 8001 inside the cluster). Exposing it via NodePort allows us to hit it from the host (kubectl or curl) for configuration. We’ll secure access simply by keeping it local (and note: in production you’d lock this down).
-- The **Proxy** (data plane) is also set to NodePort (Kong’s proxy listens on 8000 by default for HTTP). This will be the port that clients (Postman, etc.) use to hit the gateway.
-- We disable Kong’s ingress controller component (`ingressController.enabled=false`) since we will configure Kong directly via API/Helm, not through Kubernetes Ingress resources in this demo.
-
-Helm will deploy Kong and the database. The `--wait --timeout 5m` ensures the installation only completes when Kong’s pods are up and migrations have run. After a successful install, you should have (in namespace `kong`):
-
-- A Kong pod (which includes the proxy and admin API).
-- A Postgres pod for Kong.
-
-Check with `kubectl get pods -n kong` and ensure the Kong pod status is Running.
-
-Next, find the NodePort addresses for Kong’s Proxy and Admin endpoints. We can use Minikube shortcuts:
-
-```
-bashCopyEditminikube service kong-kong-proxy -n kong --url
-minikube service kong-kong-admin -n kong --url
-```
-
-These commands output URLs like `http://127.0.0.1:31234` (for example). Suppose:
-
-- Kong Admin API is at **http://127.0.0.1:32771** (random NodePort assigned)
-- Kong Proxy is at **http://127.0.0.1:31234**
-
-(Note: The Admin API might actually be on HTTPS with Kong’s default cert. If so, we’ll use `https://127.0.0.1:<admin-port>` with `-k` in curl to ignore self-signed cert issues.)
-
-**Test Kong Admin connectivity:** Run a quick test:
-
-```bash
-curl.exe -k https://127.0.0.1:<admin-port>/services
-```
-
-If Kong is fresh, the response should be something like `{"data":[],"next":null}`, meaning no services are configured yet (an empty list). This is expected – we haven’t set up any upstream services in Kong.
-
-At this point, Kong is running and ready to be configured. The next steps involve telling Kong about our backend API and setting up the necessary routes and plugins.
-
-*(If you previously installed Kong in DB-less mode or need to reconfigure, you can uninstall with `helm uninstall kong -n kong` and then reinstall with the above settings. In our case, we directly installed in DB mode.)*
-
-## Step 4: Configuring Kong Service and Route for the API
-
-With Kong running, we use the **Admin API** to register our Flask service and the route(s) we want to expose. In Kong’s terminology:
-
-- A **Service** object in Kong represents an upstream API (our Flask app) – basically the connection info for Kong to reach it.
-- A **Route** object ties a client-facing request pattern (like an URL path) to that Service. The route tells Kong “if a request comes in for `/api/hello`, send it to the backend service”.
-
-We will create a service and route for the `/api/hello` endpoint.
-
-**1. Register the Backend Service in Kong:** Use Kong’s Admin API (`/services` endpoint):
-
-```powershell
-curl.exe -k -i -X POST https://127.0.0.1:<admin-port>/services `
-  --data "name=backend-api" `
-  --data "url=http://backend-api.default.svc.cluster.local"
-```
-
-Here we are naming the service `"backend-api"` and providing the URL of our Flask service inside the cluster. `backend-api.default.svc.cluster.local` is the Kubernetes DNS name for the service we deployed in Step 2. (Port 80 is implied by default in the URL; Kong will use that.)
-
-If successful, Kong returns a `201 Created` and a JSON object representing the service (with an `id`, timestamps, etc.). Now Kong knows how to connect to our backend API.
-
-**2. Create a Route for `/api/hello`:** Now we associate a route with that service:
-
-```powershell
-curl.exe -k -X POST https://127.0.0.1:<admin-port>/services/backend-api/routes `
-  --data "paths[]=/api/hello" `
-  --data "strip_path=false"
-```
-
-This call says: for the service `backend-api`, create a route that matches requests with path `/api/hello`. We set `strip_path=false` so that Kong does **not** remove the path prefix when proxying (meaning Kong will forward the request to `http://backend-api.default.svc.cluster.local/api/hello` exactly, not strip it to `/`). This is important because our Flask app expects the `/api/hello` path.
-
-*(We could also define an additional route for just `/` or other paths if needed. In our case, `/api/hello` is the main one of interest. The command above specifically uses the Admin API with service name; alternatively, one can use the service ID.)*
-
-To verify, we can query Kong’s Admin API:
-
-- `curl -k https://127.0.0.1:<admin-port>/services` should now list the `backend-api` service.
-- `curl -k https://127.0.0.1:<admin-port>/routes` should list the route and show `"paths": ["/api/hello"]` and `"strip_path": false`file-uqmlnxgfnza9ad85zgi6b9.
-
-**3. Test the Proxy without Plugins:** Now do a direct test of the entire chain: Call the Flask API *through Kong*. Using the Kong Proxy URL we got from Minikube:
-
-```powershell
-curl.exe http://127.0.0.1:<proxy-port>/api/hello
-```
-
-If everything is configured correctly, Kong will route this to the Flask service, and you should get a response from Flask, e.g.:
-
-```json
-{"message": "Hello from backend API", "user": null, "email": null}
-```
-
-At this point, the gateway is simply forwarding the request (no auth required yet, no rate limiting). This confirms Kong knows about the service and route. The response shows the backend works via the gateway. (The `user: null` is expected since we have not gone through OAuth2 login or provided any JWT – it’s an open call.)
-
-In Postman, you can achieve the same by making a GET request to `http://127.0.0.1:<proxy-port>/api/hello`. You should see the JSON response from the backend. We haven’t configured any credentials or limits yet, so any call goes through.
-
-Now that the baseline proxying is verified, we proceed to **secure and enhance** the API with Kong’s plugins.
-
-## Step 5: Applying Rate Limiting (Protecting the API from Overuse)
-
-One of the easiest policies to implement on Kong is the **Rate Limiting plugin**. We will first set a simple **global limit** on the `/api/hello` route – for example, 5 requests per minute across all clients. This simulates protecting the API from being spammed by anyone.
-
-**Why Rate Limit:** As mentioned, it prevents abuse and ensures fair use of the API. Even in a demo, it’s useful to see how Kong can throttle calls. We’ll later refine it to per-user limits once auth is in place.
-
-**1. Enable the rate-limiting plugin on the route:** We can do this via Admin API. First, we need the identifier of the route. You can get it by `GET /routes` – find the JSON for the route we created (it will have an `id` field, a UUID). Alternatively, since we know only one route exists for that service, we might retrieve it directly. For clarity, let’s assume we got a route ID like `f372164a-...` (we’ll use a placeholder).
-
-Use the Admin API to add the plugin:
-
-```powershell
-curl.exe -k -X POST https://127.0.0.1:<admin-port>/routes/<ROUTE_ID>/plugins `
-  --data "name=rate-limiting" `
-  --data "config.minute=5" `
-  --data "config.policy=local"
-```
-
-This attaches the **Rate Limiting** plugin to that specific route. The config we provided means: allow 5 requests per minute. The `policy=local` means Kong will use in-memory counters (per Kong node). Since our demo likely has one Kong pod, this is fine. (For a distributed scenario, Kong could use a Redis or cluster policy to sync counters, but that’s beyond scope here.)
-
-Kong should return a 201 Created for the plugin. Now any calls to `/api/hello` will go through the rate limiting logic.
-
-**2. Test the rate limit:** Use Postman or a loop with curl:
-
-- Make 5 quick requests to `GET /api/hello` through Kong. The first 5 should succeed (status 200).
-- On the **6th request within the same minute**, expect `HTTP 429 Too Many Requests`. Kong will stop forwarding to the backend and immediately return 429 once the limit is exceededfile-uqmlnxgfnza9ad85zgi6b9.
-- In Postman, you can send multiple requests manually or use a quick script. If using cURL in a loop, just run it 6 times.
-
-Check the response headers on the 429 response. Kong by default includes helpful headers like:
- `X-RateLimit-Limit: 5` (the limit),
- `X-RateLimit-Remaining: 0` (remaining calls in the window),
- `Retry-After: 60` (how many seconds to wait until the quota resets)file-uqmlnxgfnza9ad85zgi6b9.
-
-These headers confirm the plugin is active. In Postman, after receiving 429, you can inspect the **Headers** tab to see those values. They essentially tell the client “you’ve hit the limit, try again after 60 seconds.”
-
-If you wait a minute (the counter resets after the window), you can call again and it should succeed.
-
-**Rate Limiting verified:** We’ve now demonstrated Kong protecting the API by rate limiting all traffic. This is a **global limit** (it doesn’t matter if the calls are from the same user or not – it’s counting total requests to that route). Next, we’ll introduce authentication so that we can enforce **per-user** limits and ensure only authorized calls go through.
-
-*(Note: The plugin was applied to the route, so if we had other routes or if we only wanted to limit specific consumers, we could attach the plugin in other ways. Kong’s flexibility allows rate limiting at Service level or per Consumer. We’ll see per-consumer usage after adding JWT.)*
-
-## Step 6: Enforcing JWT Authentication for API Access
-
-With rate limiting in place, the next layer is **authentication**. We will require clients to present a valid **JWT (JSON Web Token)** to access `/api/hello`. Kong provides a JWT authentication plugin that can verify tokens on the fly.
-
-**Concept recap – JWT:** A JWT is a token containing JSON claims (like user identity, expiry time) that is **signed by a secret or private key**. It has three parts – a header, payload, and signature – encoded as Base64 and separated by dots. For example, a JWT might look like `xxxxx.yyyyy.zzzzz`. Kong’s JWT plugin will decode and verify the signature using a public key or secret associated with the token’s issuer. If the token is valid and not expired, Kong will allow the request; otherwise, it returns 401.
-
-![img](blob:https://chatgpt.com/a03500d1-dd80-40d4-a358-bf1265e200bd) *Figure: Structure of a JWT. It consists of a header, payload, and signature. Each part is Base64Url encoded. The header typically contains the token type and signing algorithm; the payload contains claims (like `iss` issuer, `sub` subject/user, and `exp` expiration); the signature is created by signing the header+payload with a secret or private key.*
-
-**Kong’s JWT plugin setup:** Kong ties JWTs to *Consumers*. A **Consumer** in Kong represents a client or user account in the context of the gateway. We create consumers and then associate credentials (like JWT public keys) with them. The JWT plugin will map a token to a consumer by matching the token’s claims to the credentials.
-
-Steps to secure our route with JWT:
-
-**1. Create a Consumer:** We’ll set up a consumer in Kong for our demo user.
-
-```powershell
-curl.exe -k -X POST https://127.0.0.1:<admin-port>/consumers `
-  --data "username=demo-user"
-```
-
-This registers a consumer identified by `demo-user`. (The name is arbitrary; it could be an actual username or client name in a real scenario.)
-
-**2. Generate a key pair (RSA):** For JWT, we need a key to sign tokens. We’ll use RSA for asymmetric signing (so the gateway can hold the **public key** and verify tokens signed by the **private key**). You can generate keys using OpenSSL or an online tool:
-
-- Using OpenSSL (on Linux/Mac or Windows WSL):
-
-  ```
-  openssl genrsa -out private.key 2048
-  openssl rsa -in private.key -pubout -out public.pem
+  ```yam;
+  apiVersion: configuration.konghq.com/v1
+  kind: KongPlugin
+  metadata:
+    name: demo-rate-limit
+    namespace: demo
+  plugin: rate-limiting
+  config:
+    minute: 5
+    policy: local
   ```
 
-  This yields `private.key` and `public.pem`.
+  Then in the Ingress definition for the API, an annotation `konghq.com/plugins: demo-rate-limit` attaches it. When Kong’s controller sees this, it enables that plugin on the corresponding route. We could also have applied it via Kong’s Admin API as our instructions did for the Docker Compose case (POST to `/routes/{id}/plugins` with the config)file-vlrsohrq3l3b3xhshqpdxu.
 
-- *(Alternatively, an online generator or library can produce these. The key is to have a private/public key pair.)*
+In AKS, the same configuration works. We might also integrate Kong’s rate limiting metrics with monitoring – e.g., Kong can emit logs or metrics when limits are hit. For instance, Kong’s Prometheus plugin (if enabled) would expose counters for HTTP status codes, so you could see the count of 429s, etc.
 
-**3. Associate the JWT credential with the Consumer:** We will tell Kong the public key that corresponds to tokens for `demo-user`. This is done via the consumer’s JWT credentials endpoint:
+### Request Tracing and Monitoring with Postman
 
-```
-curl.exe -k -X POST "https://127.0.0.1:<admin-port>/consumers/demo-user/jwt" `
-  --data "algorithm=RS256" `
-  --data "key=demo-key" `
-  --data-urlencode "rsa_public_key=$(< public.pem)"
-```
+For demonstration and troubleshooting, we used **Postman** to simulate client requests and observe the system’s behavior. Here’s how Postman (or any HTTP client) aids in tracing and monitoring the request flow:
 
-Let’s explain: `algorithm=RS256` (we’ll use RSA SHA-256 signatures), `key=demo-key` is an arbitrary key identifier (often set as the JWT “iss” claim for matching), and `rsa_public_key` is the actual public key content (we read the `public.pem` file and URL-encode it into the request). After this, Kong knows that any JWT with issuer `demo-key` should be verified with this public key and, if valid, associated to consumer `demo-user`.
+- **OAuth Flow Visibility:** By using Postman to hit the API initially, we can see the *redirect* response from Kong/OAuth2 Proxy. In our test, a request to `/api/hello` without a session got a `302 Found` redirect to GitHub (something like `Location: https://github.com/login/oauth/authorize?...`). Postman’s console or output shows this redirect. While Postman itself won’t follow the OAuth login (since it’s not a browser), this confirms the gateway and proxy are correctly requiring auth. In a browser, this would seamlessly go to GitHub.
+- **Simulating Authenticated Calls:** After obtaining the session cookie (by actually logging in via a browser, or by capturing the cookie set by OAuth2 Proxy), we can include that cookie in Postman for subsequent requests. We did this to test a successful authenticated call. Postman then directly requests `/api/hello` with the cookie header, and we observed a `200 OK` with the JSON response containing our user info and message. This shows the flow after login is working – OAuth2 Proxy recognized the cookie and allowed the request through to the backend.
+- **Headers and Debug Info:** Postman allows us to inspect all response headers. We used this to verify the presence of rate-limit headers from Kong and the forwarded user headers reaching the backend’s response. For example, in the 200 OK response, we saw headers like `X-RateLimit-Remaining` and in the body the `user` field was populated – confirming integration. This manual tracing is helpful for the team to understand which component added what header (Kong adds rate-limit headers, OAuth2 Proxy adds X-Forwarded-User).
+- **Rate Limit Testing:** We also used Postman (or a simple curl loop) to send multiple requests in quick succession. The first 5 returned 200 OK, and the 6th returned 429, as expectedfile-vlrsohrq3l3b3xhshqpdxu. Postman’s interface made it easy to send requests one after another. This demonstrated the rate limiting in action to the team.
+- **Monitoring Tools:** In a more advanced sense, “monitoring” could refer to setting up Postman Monitors – which are automated collections of requests run on a schedule to test your API’s availability. One could create a Postman collection for the API (with proper authentication) and have it run periodically to ensure everything is up and to measure response times. For our demo, we didn’t set up an automated monitor, but it’s something to mention: Postman can hit the endpoint and verify responses (e.g., status code, content) regularly, which is useful for uptime monitoring.
+- **Kong Manager / Logging:** Since Kong OSS doesn’t include a full UI, we relied on logs. If you run Kong locally, it logs each request with details (method, URL, response code, etc.). In Kubernetes, you can check the Kong proxy pod’s logs. We did check logs to confirm that Kong was invoking the correct route and plugin. For instance, Kong log shows HTTP 429 for the rate-limited request, verifying the plugin worked. The logs also show upstream latency (time taken by OAuth2 Proxy and backend) and total latency, which is useful for performance monitoring.
+  - Kong Enterprise’s **Manager** UI or Kong Konnect could give a graphical view of the service, but in our case we likely did not use those due to using Kong OSS. Instead, simple logging and manual monitoring sufficed. We listed “Kong Manager / Logs” in the plan for monitoring, to indicate either using an interface or logs to observe traffic.
+- **Tracing (Distributed Tracing):** While not implemented in this demo, it’s worth noting that Kong can integrate with tracing systems (like Jaeger or Zipkin) by adding a plugin that injects trace IDs. If we had that, each request through Kong could be traced across services. Our mention of “request tracing” was more in the sense of following the path of a request manually. For teaching purposes, we stepped through each component to trace how a request travels (client -> Kong -> oauth2 -> backend, and back).
 
-Now, Kong is configured with a consumer and its JWT credential. Next:
+Using Postman and the logs, the team can clearly see the effects of our protections:
 
-**4. Enable the JWT plugin on our route:**
+1. **Unauthorized request** -> **redirect** (no data leaked, secure).
+2. **Authorized request** -> **success** (200 OK with user info).
+3. **Excessive requests** -> **rate limit** (429 responses after threshold).
+4. Headers like `X-Forwarded-User` present in backend’s output indicate identity propagation working.
 
-```powershell
-curl.exe -k -X POST https://127.0.0.1:<admin-port>/routes/<ROUTE_ID>/plugins `
-  --data "name=jwt"
-```
+These verifications give confidence that our configuration is correct. We also emphasize to the team that any 401/403 errors during setup likely mean a misconfiguration in OAuth2 Proxy (e.g., cookie or client ID issues), and any missing rate limit headers mean the plugin might not be properly applied – demonstrating how to use these tools for troubleshooting.
 
-This tells Kong that the `/api/hello` route now requires JWT auth. The plugin will look for an `Authorization: Bearer <token>` header in requests. If absent or invalid, the request will be rejected with 401. If present and valid, Kong will consider the consumer authenticated and allow the request to proceed (also, Kong will set `X-Consumer-Username: demo-user` on the upstream request, which could be used for logging or upstream logic if needed).
+## Kong vs. Tyk: Core Feature Comparison
 
-At this point, the route is locked down – any request without a proper token will get a `401 Unauthorized` from Kong. Let’s obtain a token to test:
+Finally, let’s **briefly compare Kong and Tyk** (another popular open-source API gateway) in terms of the core features relevant to our discussion: plugin support, policy enforcement, authentication options, scalability, and monitoring.
 
-**5. Create a JWT for testing:** We have the private key from earlier. We need to create a token signed with it. The token’s **claims** must include:
+- **Plugin Support and Extensibility:** Kong is known for its rich ecosystem of plugins. As of writing, Kong offers dozens of plugins (77+ in open-source) for various functionality – authentication (basic auth, key auth, JWT, OAuth2, etc.), security (IP restriction, bot detection), traffic control (rate limiting, caching), transformations (request/response modification), logging (to files, HTTP, syslog), and more. Kong is built on Nginx with Lua via OpenResty, so advanced users can even write custom Lua plugins for bespoke needs. (Kong’s plugin development kit makes this easier). Some advanced plugins (LDAP auth, OpenID Connect) are reserved for Kong Enterprise, but the OSS selection is still very broad.
+   Tyk, in its open-source gateway, has fewer built-in plugins (on the order of <10 main plugins). It covers basic needs (auth, quota, rate limit, etc.), but it’s not as extensive as Kong’s hub. However, Tyk is written in Go and provides a flexible plugin system supporting multiple languages: you can write custom plugins in JavaScript, Python, Lua, .NET, or Go, and even via gRPC sidecar plugins. This polyglot plugin support is a strength of Tyk – it might be easier to integrate custom logic in a language of your choice, whereas Kong (OSS) limits you to Lua (unless you use Kong’s PDK which is Lua-based or go with enterprise/go plugins in Kong 2.x+). In summary, Kong has more pre-made plugins (community-driven), while Tyk has a simpler core set but the ability to extend in various languages.
+- **Policy Enforcement (Rate limiting, Quotas, etc.):** Both Kong and Tyk are capable of enforcing policies like rate limiting, quotas, and access control.
+  - In Kong, as we’ve seen, rate limiting is a plugin that can be configured per service, route, consumer, or globally. Kong’s rate limiting can work with a database or Redis to handle cluster-wide limits. It’s very production-proven and can handle high load. Kong also has plugins for IP whitelisting/blacklisting and even integration with external policy engines (OPA, etc., via plugins).
+  - Tyk also provides rate limiting and quota management. In Tyk, policies are often defined in its API definitions or via its dashboard. Tyk’s gateway has a concept of “policies” which can bundle an API’s rate limits, quotas, and access rules, and then you can assign keys or tokens to those policies. Tyk’s open source supports rate limiting (it typically requires Redis for storing counters in a cluster). According to some benchmarks, Kong’s rate limiting (with Redis) vs Tyk’s are comparable, but Tyk highlights an algorithm for distributed rate limiting without single Redis bottleneck in newer versions. Both can enforce per-user or global limits similarly. So on policy enforcement, they are roughly equivalent in capabilities, though the configuration differs (Kong via plugins/consumers, Tyk via policy docs or the dashboard).
+- **Authentication Features:** Both gateways support a range of auth methods:
+  - **Kong:** Key auth (API keys), Basic auth, JWT, OAuth2 (acting as an OAuth server for issuing tokens), HMAC signatures, and others via plugins. For OIDC integration, Kong OSS might require some setup (e.g., using the JWT plugin with OIDC provider’s keys). The Kong Enterprise edition has a turnkey OIDC plugin that can handle the full flow with providers. The TechTarget analysis notes Kong OSS has slightly more limited auth options out-of-the-box for complex scenarios like LDAP or OIDC (those might need enterprise plugins). But in practice, Kong OSS covers most needs except direct integration with external OAuth servers (which we solved by using OAuth2 Proxy in our demo).
+  - **Tyk:** Tyk supports similar methods – it has API keys, basic auth, JWT validation, OAuth2 (Tyk can do OAuth2 token issuance and validation), and it touts support for OpenID Connect and mTLS in the open source gateway. Tyk’s docs claim you don’t need extra plugins for things like OIDC or mTLS – they’re built-in. In other words, Tyk comes with a wide range of auth support “out of the box” without needing to write custom plugins, whereas with Kong OSS, something like OIDC might need custom configuration or the Enterprise plugin. In our context (GitHub OAuth), neither Kong nor Tyk have a direct built-in integration, so we used OAuth2 Proxy – we could similarly pair OAuth2 Proxy with Tyk if needed. Tyk’s “Authentication that suits your setup” claim is that whether you need modern OAuth/OIDC or old-school Basic Auth, Tyk can handle it in OSS. Kong can handle them too, but maybe requires more community plugin usage for some.
+- **Performance and Scalability:** Both Kong and Tyk are high-performance gateways designed to scale horizontally.
+  - Kong is built on Nginx (which is very efficient at proxying). Benchmarks have shown Kong to have excellent throughput and lower latency under high concurrency. In fact, Kong tends to **surpass Tyk in raw performance benchmarks** for throughput and latency at high request rates. Kong’s architecture (with Nginx + C* or Postgres + local caching) handles thousands of requests per second easily. One cited test found Kong handled concurrency and scaling “more efficiently,” which is important when spikes occur. Kong nodes are stateless (if DB-less or if DB-backed with caching), so you can scale by adding more pods/nodes behind a load balancer. The main consideration is if using a database, that database can become a bottleneck or single point of failure. For HA, you’d run a cluster of Postgres/Cassandra for Kong. Kong’s DB-less mode avoids that by using declarative config – great for Kubernetes (we can treat Kong config as code).
+  - Tyk is written in Go and also very performant. Tyk easily handles thousands of requests per second too (in one test, ~4000 rps with default settings). Tyk’s scalability notes: it uses Redis as a backing store for some data (and MongoDB for analytics in older setups; newer versions can be configured differently). To scale Tyk, you add more gateway instances connected to the same Redis/Mongo. Tyk tends to be more CPU-bound; it’s noted that once CPU usage gets high, you should scale out another node. Kong’s bottleneck is often the database or network I/O, whereas Tyk’s in-memory operations might need tuning. In short, both scale horizontally and can be used in large distributed systems. Kong might have an edge in peak performance, whereas Tyk is perfectly fine for most loads and has improved its performance over versions (especially if one disables certain features or uses their async logging).
+  - From our demo perspective (a handful of requests), both are overkill in capacity. But it’s good to know that if this were a production API, Kong would not likely be the limiting factor – it can handle a classroom of users easily, and an enterprise’s worth with proper setup.
+- **Monitoring and Analytics:**
+  - **Kong:** In OSS, Kong provides logging (you can configure file logs, HTTP logs to an external system, etc.) and metrics (via plugins like the Prometheus plugin). You can plug Kong into Grafana/Prometheus to monitor request rates, latency, etc. Kong’s Admin API also allows querying some stats and its status. For full analytics (e.g., historical charts of request counts, top APIs, etc.), Kong offers an enterprise solution (Kong Manager + Kong Vitals) which is not available in OSS. In our demo, we stuck to basic monitoring: checking logs and using Postman to watch responses. But one could integrate Kong with ELK stack or other monitoring. Kong is very ops-friendly in that sense but you have to set up the tooling.
+  - **Tyk:** Tyk open source gateway has a component called the “Pump” in Tyk’s architecture. The Pump takes API analytics data (request metrics, logs) from the gateway and pushes it to various sinks (InfluxDB, Prometheus, Elastic, etc.). The open source gateway will emit raw data and the Pump (also open source) can store it. However, the visualization and analysis of that data is typically done via the **Tyk Dashboard**, which is a commercial component (closed-source) unless you use their free developer license. In purely open source usage, you might integrate the Pump with something like Grafana to see metrics. Tyk does have a “Developer Portal” and dashboard in their closed source offering which gives a lot of out-of-the-box analytics (like charts of usage by API, by key, etc.). So for monitoring, both gateways rely on external systems in OSS form (Prometheus/Grafana, ELK, etc.). Kong Enterprise has it built-in, Tyk has an official paid dashboard, whereas Kong OSS might require third-party UIs (there are community ones like Konga for basic management, but not as advanced for analytics).
+- **Community and Support:** (Not explicitly asked, but notable) Kong has a large community and many community plugins, as it’s very open and extensible. Tyk is open source but more driven by the company (slightly smaller community footprint). The TechTarget summary put it nicely: *“Kong is more community-driven and extensible, while Tyk focuses on operational simplicity”*. Tyk’s benefit is a cohesive design where many features (like OIDC) just work out-of-box in OSS, so less need to hunt for plugins.
 
-- `iss: "demo-key"` – this must match the `key` we gave Kong (so Kong knows to use the corresponding public key).
-- `sub: "demo-user"` – the subject (who the token represents). Optional but we’ll include it for clarity.
-- `exp: <future timestamp>` – expiration time. We should set this to some time in the future (e.g., current time + 10 minutes or +1 hour) so the token is valid.
+In conclusion, **Kong vs Tyk** – both are capable API gateways. Kong often wins in raw performance and breadth of plugin functionality. Tyk, however, provides a strong open-source package with many features included and flexible plugin development, and it’s often praised for ease of setup. In our demo’s context (GitHub OAuth, JWT, rate limiting), either gateway could achieve the goal. We chose Kong due to familiarity and its integration as an ingress controller in K8s (Tyk can also act in K8s, but Kong’s ingress controller is very straightforward to deploy with Helm). The comparison above was to help the team understand that the core concepts (auth, rate limiting, monitoring) apply to any gateway, with some differences in implementation.
 
-There are a couple ways:
+Both Kong and Tyk are horizontally scalable and suitable for production. Kong’s slight edge in community plugins and proven high-concurrency performance made it a solid choice for our needs, but teams should consider specific requirements (e.g., need built-in OIDC? Or prefer a particular management UI?) when choosing between them.
 
-- **Manual (jwt.io):** Go to jwt.io. In the debugger, set the header to `{"alg":"RS256","typ":"JWT"}` and payload to `{"iss":"demo-key","sub":"demo-user","exp": <future UNIX time>}`. Then paste your **private key** into the signing key section. It will generate a token string. Copy that token.
+## Conclusion
 
-- **Python script:** If you prefer, use a library like PyJWT:
+This report outlined a comprehensive architecture for API security using Kong Gateway and OAuth2 Proxy. We covered how to deploy and configure the system in both local Kubernetes (Minikube) and Azure AKS, how Kong acts as an ingress API gateway enforcing rate limits and routing rules, and how OAuth2 Proxy seamlessly adds OAuth authentication (with GitHub in our case) on top of the API without changing the backend. We explained the major configuration items that make this possible – from Kong’s plugin settings (e.g., rate limit thresholds, JWT credentials) to OAuth2 Proxy’s OAuth client setup and cookie handling – and traced the lifecycle of a request from an unauthenticated redirect to an authenticated API response.
 
-  ```python
-  import jwt, datetime
-  payload = {"iss": "demo-key", "sub": "demo-user", "exp": datetime.datetime.utcnow() + datetime.timedelta(minutes=10)}
-  token = jwt.encode(payload, open("private.key","r").read(), algorithm="RS256")
-  print(token)
-  ```
+Additionally, we provided a technical overview of JWTs to solidify understanding of token-based auth, and we discussed how JWT auth and the OAuth2 Proxy approach might be combined or used separately with Kong. Using Postman and logs, we illustrated how to monitor and verify that the protections are working (seeing 302 redirects for login, 200 OK for authorized calls, and 429 errors when limits are exceeded). Finally, we compared Kong with Tyk to give context on gateway choices, noting that both are capable but Kong offers more plugins and community support while Tyk emphasizes all-in-one simplicity and multi-language extensibility.
 
-  This will output a JWT (as a byte string in Python; decode to string if needed).
-
-Either way, get a token string (it will look like a long string with two dots). This token is signed with our private key, and Kong has the matching public key.
-
-**6. Test an authenticated request:** In Postman, do a GET to `http://127.0.0.1:<proxy-port>/api/hello`. Under **Authorization** tab, choose “Bearer Token” and paste the JWT token. Send the request.
-
-- If the token is valid, the request should succeed (status 200). The response from Flask might now include `"user":"demo-user"` if the OAuth2 Proxy was involved, but since here we are directly using Kong’s JWT (no OAuth2 Proxy yet), our Flask app might not see a forwarded user. However, Kong will forward the request. *(Kong by default doesn’t inject the consumer name into the request headers unless using an auth plugin that does so; the JWT plugin doesn’t automatically forward the JWT or consumer info to upstream, aside from consumer headers. We could configure it to forward the `iss` as an upstream header if needed.)* For our purposes, seeing a 200 response means the token was accepted.
-- If the token was missing or wrong:
-  - Missing token yields `HTTP 401 Unauthorized` with possibly a body `{"message":"Unauthorized"}`.
-  - If the token’s signature doesn’t match, or `iss` isn’t recognized, Kong returns 401 as well.
-  - If the token is expired (`exp` in the past), Kong returns 401 (with `{"message":"Unauthorized"}`).
-
-We can simulate failure by sending no token or altering one character in the token to corrupt it.
-
-Now our API endpoint is effectively **protected by JWT auth**. Only those with a valid token signed by our key can access it. This is a common pattern for service-to-service auth or user auth in microservices.
-
-**7. Per-Consumer Rate Limiting:** Since we now have distinct consumers (the JWT ties requests to a consumer), we can refine rate limiting. Earlier, we set a global 5/min limit. Perhaps we want to allow each user to have their own quota. We can achieve this by applying the rate-limiting plugin on the **Consumer** entity instead of (or in addition to) the route.
-
-For example, to set a rate limit of 3 requests/minute for the consumer `demo-user`:
-
-```powershell
-curl.exe -k -X POST https://127.0.0.1:<admin-port>/consumers/demo-user/plugins `
-  --data "name=rate-limiting" `
-  --data "config.minute=3" `
-  --data "config.policy=local"
-```
-
-Now, when `demo-user` calls the API, Kong will count their requests separately and enforce 3/min for them. Another consumer (if created) could have a separate counter. This is powerful because it means one heavy user won’t consume the entire API quota for others. For our single user demo, it just demonstrates that Kong can do per-user limits once authentication is in place.
-
-To test this, you could remove or raise the global limit to not interfere, then try >3 requests with the token within a minute – the 4th should get 429. The `X-RateLimit-Remaining` header now would be tied to the consumer’s limit. Kong’s response headers also include `X-RateLimit-Limit-demo_user: 3` (if configured to show consumer-level, though this might be an enterprise feature; anyway the concept stands).
-
-**Summary so far:** We have a locked-down API: the client must present a valid JWT and is limited to N requests per minute. We used Kong’s Admin API to dynamically configure all of this, showing how an ops team could adjust policies in real-time. The backend service hasn’t changed at all during this – all security was added at the gateway level.
-
-## Step 7: OAuth2 Proxy Integration (GitHub OAuth Login)
-
-The JWT approach assumed you can obtain a token out-of-band (we manually created one). In a user-facing scenario, you’d typically have an **OAuth2 Authorization Code flow** to let users log in via a web UI and get a token or session. To demonstrate this more interactive auth, we include an **OAuth2 Proxy** in our architecture.
-
-**What is OAuth2 Proxy?** It’s a utility that acts as a reverse proxy requiring authentication. It supports providers like Google, GitHub, etc. Essentially, it intercepts requests, and if the user isn’t logged in, it redirects them to the OAuth provider. Upon return, it establishes a session (often via a secure cookie) and then forwards the original request to the upstream service (adding headers like the user’s login name).
-
-In our setup:
-
-- We configure OAuth2 Proxy to use **GitHub** as the OAuth provider. This requires creating a GitHub OAuth app (to get a Client ID and Secret) and configuring allowed callback URLs (likely pointing to our proxy).
-- The OAuth2 Proxy will run inside K8s and proxy to our Flask API. Once authenticated, it will inject `X-Forwarded-User` (the GitHub username or email) which our Flask app can read.
-
-**Deploy OAuth2 Proxy:** We have a manifest (oauth2-proxy deployment and service). Key settings in the config (often done via environment variables or a config file):
-
-- The OAuth provider (GitHub) and the client ID/secret from our GitHub OAuth App.
-- The cookie secret (random string for signing session cookies).
-- The upstream URL (where to send authenticated requests) – in our case, the Flask API service.
-- Allowed email domains or GitHub orgs (optional filters).
-- The OAuth scopes and endpoints.
-
-For example, an `oauth2-proxy.yaml` might include:
-
-```yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: oauth2-proxy
-spec:
-  template:
-    spec:
-      containers:
-      - image: quay.io/oauth2-proxy/oauth2-proxy:v7.4.0
-        args:
-        - --provider=github
-        - --client-id=<GitHub_OAuth_ClientID>
-        - --client-secret=<GitHub_OAuth_ClientSecret>
-        - --cookie-secret=<random_32byte_secret>
-        - --upstream="http://backend-api.default.svc.cluster.local:80"
-        - --redirect-url="http://<MINIKUBE_HOST>:<PROXY_PORT>/oauth2/callback"
-        - --cookie-domain=localhost
-        - --cookie-secure=false
-        - --email-domain="*"
-        # etc...
-```
-
-This is an example; the actual config might differ slightly. The **redirect URL** needs to match what we registered in GitHub (here, it points to the route on our Kong proxy that will handle the callback – Kong will route `/oauth2/callback` to the proxy service).
-
-We expose the OAuth2 Proxy on a NodePort as well (say on port 4180) for testing from the host. Alternatively, we could route it entirely behind Kong (for instance, make Kong route `/oauth2/*` to the oauth2-proxy service). There are a couple of integration patterns:
-
-- **Separate subdomain or port:** In our case, using NodePort 4180 (or an alternative domain) to access the OAuth2 Proxy directly.
-- **Kong as a single gateway:** Kong can route `/oauth2/...` paths to the OAuth2 Proxy and everything else to the backend. This requires multiple Kong routes with different upstream targets. For instance, route `/oauth2/(.*)` → oauth2-proxy service, and route `/api/hello` → backend (but perhaps only after auth).
-
-For simplicity, we might expose OAuth2 Proxy on `localhost:4180` and use it as the main entry for authenticated access. Actually, from the readme snippetfile-uqmlnxgfnza9ad85zgi6b9, it appears they accessed the proxy directly at `http://localhost:4180/oauth2/start` to initiate login, and then used it at `http://localhost:4180/api/hello` with the cookie.
-
-**Kong + OAuth2 Proxy flow:** Another approach is to have Kong always send `/api/hello` traffic to the OAuth2 Proxy first (making the proxy an upstream for that route), and the proxy then calls the backend. In this chain:
-
-- Client calls Kong `/api/hello`.
-- Kong (with no JWT plugin in this scenario) proxies to OAuth2 Proxy.
-- OAuth2 Proxy sees no session -> redirects client to GitHub.
-- After login, GitHub redirects client back to `/oauth2/callback` on Kong.
-- Kong routes `/oauth2/callback` to OAuth2 Proxy (we need a Kong route for that).
-- OAuth2 Proxy completes auth, sets cookie, and redirects user to the original `/api/hello`.
-- Now user calls `/api/hello` again (perhaps automatically by the proxy’s redirect).
-- This time, OAuth2 Proxy sees a valid session cookie and forwards the request to Flask, which returns "Hello" with the user info.
-
-As you can tell, this is a bit complex to simulate via Postman alone (since Postman doesn’t handle browser redirects easily). In a live demo, one can use a real browser for the OAuth login part, then switch to Postman for API calls using the obtained session cookie.
-
-**Configuring Kong for the OAuth2 Proxy:** We add Kong routes:
-
-- `/oauth2/start` and `/oauth2/callback` should be proxied to the oauth2-proxy service. (The proxy typically handles `/oauth2/start` to begin auth and `/oauth2/callback` as the redirect URI.)
-- The main API path `/api/hello` – we could either point directly to backend (with JWT plugin as we did) OR point to oauth2-proxy service (and let the proxy forward to backend). In the readme final step, they opted to skip JWT plugin and use OAuth2 Proxy entirely, meaning Kong’s route for `/api/hello` likely was reconfigured to go to oauth2-proxy (which in turn calls backend). This way, OAuth2 Proxy deals with auth via GitHub and manages its own session cookie.
-
-So we can adjust Kong’s service for `/api/hello` to use the OAuth2 Proxy as upstream:
- For example:
-
-```powershell
-# (Reconfigure or add a new service for oauth2-proxy)
-curl.exe -k -X PUT https://127.0.0.1:<admin-port>/services/backend-api `
-  --data "url=http://oauth2-proxy.default.svc.cluster.local:80"
-```
-
-(This would repoint our existing service to the proxy, which then calls backend. Alternatively, create a new service and route for the oauth2 proxy and adjust accordingly.)
-
-In practice, due to time, one might simply access the proxy’s NodePort directly for demonstration:
-
-- Open `http://localhost:4180/oauth2/start` in a browser, go through GitHub login.
-- The proxy sets a cookie `_oauth2_proxy` in your browser upon success.
-- Then in Postman, call the OAuth2 Proxy’s URL for the API (bypassing Kong): e.g. `http://localhost:4180/api/hello` with the cookie from the browser. The result should be 200 OK with `"user":"<your_github_username>"` in the JSON.
-- However, if we want Kong in the loop, we’d ensure calling through Kong on port 31234 (with Kong routing to proxy as described). The readme snippet suggests they used port 4180 directly (which was likely the proxy NodePort).
-
-For clarity in the presentation, we can describe the conceptual flow without getting lost in the configuration details:
-
-**Demo flow with OAuth2 (conceptual):**
-
-1. **User initiates request** – e.g., browsing to `http://<KONG>/api/hello` (or hitting the endpoint in Postman without a token).
-2. **Redirect to IdP** – The OAuth2 Proxy (via Kong) sees no session and redirects to GitHub login.
-3. **User authenticates** – User logs in on GitHub and approves.
-4. **Callback** – User is redirected back to the proxy (through Kong) at `/oauth2/callback` with an auth code. The proxy exchanges this for an access token (internally) and creates a session.
-5. **Set session and forward** – The proxy sets a cookie `_oauth2_proxy` in the user’s browser as a sign of the session. It then either redirects the user to the original page or, if the original request was waiting, proceeds to forward it.
-6. **Authorized request** – Now the user has a session. If they request `/api/hello` again (with the cookie present, which the browser sends), the OAuth2 Proxy will recognize the user and forward the request to the Flask API, including headers like `X-Forwarded-User: <GitHub username>`.
-7. **Response** – The backend returns "Hello from backend API" along with the user information in JSON. This goes back through OAuth2 Proxy -> Kong -> to the user’s browser or client.
-
-From the user’s perspective, after logging in, they get the API response. From Kong’s perspective, it’s just proxying to the auth service and then to backend; Kong itself didn’t validate JWT (in this approach) – the OAuth2 Proxy handled authentication. We essentially replaced the JWT plugin with an external auth service in this flow.
-
-**Rate limiting per consumer with OAuth2:** Since OAuth2 Proxy by default doesn’t create Kong consumers automatically, one approach could be: treat each session or user as a consumer by some identifier (maybe GitHub username). If we had Kong’s OIDC plugin (enterprise), it could do that mapping. In our case, an easy demonstration is to apply a rate limit plugin on the OAuth2 Proxy’s route or service as a whole. Alternatively, since we know all traffic is from one user (you), our earlier rate limiting still works globally. For a more advanced setup, one could script the creation of a Kong consumer for each new OAuth2 user and tie it in – but that’s beyond a classroom demo scope. We can simply mention that **if multiple users access, Kong can still impose per-user limits** (with custom logic or enterprise features).
-
-**Testing OAuth2 flow in the demo:**
-
-- Have a web browser ready to perform the login portion (since Postman can’t do interactive OAuth easily).
-- After login, use Postman to make an API call with the session cookie, or simply show the result in the browser. The readme suggests copying the `_oauth2_proxy` cookie from browser dev tools and using it in Postmanfile-uqmlnxgfnza9ad85zgi6b9file-uqmlnxgfnza9ad85zgi6b9. This is a clever way to use Postman to test the authenticated call: you add a header `Cookie: _oauth2_proxy=<value>` in Postman, then GET the Kong/Proxy URL for `/api/hello`. If done right, you’ll see a 200 and the response with your user info, and Kong’s logs will show a successful pass.
-
-We’ll ensure to highlight this in the presentation, possibly by doing a quick live login and then using that cookie in Postman to show the API output and also maybe the log entry in our mock log service.
-
-*(At this stage, we have shown two methods of auth: static JWT and a real OAuth2 login flow. It underscores how Kong can work with both approaches – directly verifying tokens or delegating to an OAuth2 Proxy.)*
-
-## Step 8: Monitoring and Logging the Requests
-
-Aside from protecting APIs, an API gateway gives insight into traffic. We will demonstrate basic monitoring via logs:
-
-**Kong Logging Plugin:** Kong can log requests to various endpoints (file, syslog, HTTP, etc.). We use the **http-log plugin** to send logs of each request to a dummy HTTP endpoint (httpbin). This simulates how you might send logs to an external logging service.
-
-We deploy a **mock logging service** (in the readme, they used `kennethreitz/httpbin` image) inside the cluster:
-
-```
-kubectl run mock-logger --image=kennethreitz/httpbin --port=80
-kubectl expose pod mock-logger --name=mock-logger --port=80
-```
-
-This gives us a service `mock-logger` that basically will echo any requests it receives (httpbin has an endpoint `/post` that just logs the posted data).
-
-Now enable the plugin on our route:
-
-```powershell
-curl.exe -k -X POST https://127.0.0.1:<admin-port>/routes/<ROUTE_ID>/plugins `
-  --data "name=http-log" `
-  --data "config.http_endpoint=http://mock-logger.default.svc.cluster.local/post" `
-  --data "config.method=POST"
-```
-
-This config means: for every request on this route, Kong will asynchronously POST a JSON log to the httpbin service’s `/post` endpoint. The log includes details like route, consumer, response code, latency, etc.
-
-To see it in action, we can `kubectl logs` the httpbin pod (mock-logger) to watch for incoming posts. Then, when we make some requests to our API (either JWT-authenticated ones or via OAuth2 Proxy with cookie), Kong will send logs. We should see in httpbin’s output the entries for each request.
-
-For example, a log entry might contain the consumer (‘demo-user’), the path `/api/hello`, response time, response code 200, etc. We can show these logs to the audience to illustrate how Kong provides observability.
-
-**Kong Manager (UI):** Note that Kong OSS primarily is configured via API/CLI, but there is an add-on GUI (Kong Manager) in Kong Enterprise. We won’t have that here, but it’s worth mentioning that in a real scenario, a web dashboard could be used for some of this. Our focus is on the open-source tooling (Admin API, kubectl, logs, Postman).
-
-**Postman for tracing:** We have already used Postman to simulate requests. We can also use it to see headers (as we did for rate limit) and to organize a collection of test calls:
-
-- One request for an unauthenticated call (expect 401 after JWT plugin enabled).
-- One with token (expect 200).
-- A runner sending multiple calls to hit rate limit (Postman can do limited scripting or we do that manually).
-- A request including the cookie for OAuth2 (to show 200 with user info).
-   We can save these and show each working or failing as expected, giving a clear picture of the policies in effect.
-
-Finally, **monitoring the cluster:** We should keep an eye on Minikube’s dashboard or use `kubectl get pods` to show everything running (Kong, Postgres, OAuth2 Proxy, backend, logger). If something fails, logs (`kubectl logs <pod>`) are the first place to check. For instance, if OAuth2 Proxy isn’t redirecting correctly, its logs would show what’s wrong (maybe a redirect URL mismatch). If Kong’s not forwarding, Kong’s logs might show route or plugin errors.
-
-## Suggested Presentation Flow & Team Responsibilities
-
-This project is rich in content, suitable for a ~2 hour session. To manage time and keep it engaging, the work can be split among team members, each focusing on specific aspects:
-
-- **Presenter 1 – Introduction & Theory:** Explain the core concepts of API gateways, authentication, and rate limiting. This includes the slides on what Kong/Tyk are, why we use JWT/OAuth, and the high-level architecture diagram. This sets the stage for the demo. (This person can use the conceptual diagram to discuss how an API Gateway fits in a microservice environment, and cite examples[descope.com](https://www.descope.com/blog/post/kong-gateway-authentication#:~:text=An API gateway is a,track service performance and availability)[descope.com](https://www.descope.com/blog/post/kong-gateway-authentication#:~:text=The Kong Gateway is a,seamless API integration and high).)
-
-- **Presenter 2 – Backend Service & Environment Setup:** Cover Step 1 and 2 – the Flask API, how it was containerized, and deployed on Minikube. Show a snippet of `app.py` and the Docker build process. Then explain how Minikube is set up and how we verified the backend is running (perhaps a quick `curl` to the service). This gives the audience an understanding of the baseline app we are protecting.
-
-- **Presenter 3 – Kong Deployment & Configuration:** Walk through installing Kong (Helm basics, the values used) and then demonstrate adding the service and route via Admin API. This is a great place to do a live curl or use a REST client to show how we tell Kong about the backend. After configuring, do the first test through Kong (show that without plugins, the gateway simply proxies the request). Highlight how Kong is configured declaratively via these API calls (or could be via config files too), similar to how one would in a real deployment.
-
-- **Presenter 4 – Security Policies (Plugins):** Introduce the plugins. Possibly split this into two sub-parts:
-
-  - **Rate Limiting:** Show how the plugin is enabled and test the effect. This can be a quick live demo: send multiple requests (maybe using a quick Postman runner or a shell loop) and then show the 429 response and the headers. Explain the significance of those headers.
-  - **JWT Authentication:** Explain JWT briefly (possibly referencing the JWT structure image) and then show how we set up the JWT plugin. This could be partly slides (for concept) and partly demo (maybe pre-generated token to avoid doing it live, but you can show the contents of a token on jwt.io). Then demonstrate a call without token (gets 401) vs with token (gets 200).
-  - Emphasize that now we have **both** auth and rate-limit – if time, show that exceeding limit with a valid token still gives 429 (which means the plugins are working in tandem).
-
-  Because JWT setup is a bit fiddly (especially generating the token), this presenter should prepare the token beforehand and perhaps just explain how it was generated.
-
-- **Presenter 5 – OAuth2 Login Integration & Logging:** Finally, cover the OAuth2 Proxy integration as a more “real-world” auth scenario. This part can be a bit complex, so the presenter should carefully explain the flow with a diagram or sequence: user -> GitHub -> etc. Then perhaps do a live mini-demo: open browser to log in via OAuth2 Proxy (GitHub). After login, copy the cookie to Postman and show an API call succeeding with that cookie. This proves the concept. They should also mention how this relates to the gateway (if Kong is routing to the proxy or if we used the proxy as a separate endpoint in the demo).
-
-  - Also cover the **logging plugin**: show logs being produced for requests. If possible, demonstrate that after making the requests, the `mock-logger` service received a POST (perhaps by showing `kubectl logs mock-logger`). This closes the loop, showing we not only protected the API but also have visibility into calls.
-  - If any metric or Kong Manager UI was available, mention it, but primarily we’ll stick to logs.
-
-Throughout the demo, all presenters should coordinate transitions. For example, Presenter 3 (Kong config) can hand off to Presenter 4 by saying “Now that Kong is forwarding requests, let’s secure it – [Name], can you show how we add auth and rate limiting?”. Similarly, Presenter 4 can hand to 5 by saying “We used a static token for JWT; in a real app, users would log in – [Name] will show how we integrated GitHub login using an OAuth2 Proxy.”
-
-Everyone should be familiar with the entire flow, as questions could pop up at any point. The division is mainly to distribute speaking roles:
-
-- **Slide content:** likely covered by Presenter 1 (theory) and a bit by others when introducing their parts.
-- **Live terminal/Kong admin tasks:** Presenter 3 and 4 might be at the terminal showing `curl` commands and Postman.
-- **Live browser demo:** Presenter 5 for OAuth2 login.
-
-Backup each live step with a prepared result (screenshots or pre-recorded short clip) in case something doesn’t work (Minikube can be finicky under pressure).
-
-## Troubleshooting Tips and Best Practices
-
-Setting up this demo in Minikube involves multiple components. Here are some tips to avoid or resolve common issues:
-
-- **Minikube Setup:** Use a consistent driver (docker) and allocate enough memory/CPUs if possible (`minikube start --cpus=4 --memory=4g` for example) since we’re running a database, Kong, etc. If something isn’t working, `minikube status` and `kubectl get pods -A` can show if a pod is CrashLooping (e.g., Kong’s database migration failed).
-- **Helm/Kong Issues:** If `helm install kong ...` hangs or fails, check if you might still have an old installation. Running `helm uninstall kong -n kong` to remove any previous release and then reinstall can help. Ensure your values enable the Admin API – without it, you won’t be able to POST routes/services. Also, if the Admin API is on HTTPS (which it is by default), remember to use `-k` to ignore the self-signed cert, or configure Kong with an environment variable to allow HTTP on admin (not recommended in real scenarios, but okay locally).
-- **Kong Admin API connectivity:** If `minikube service kong-kong-admin --url` returns an address that isn’t working, you can try `kubectl port-forward svc/kong-kong-admin -n kong 8001:8001` to map it to localhost:8001. Similarly for proxy (8000:80 or such). Sometimes NodePorts on Minikube with certain drivers might be less accessible – port-forward is a straightforward fallback for accessing services.
-- **Backend API not reachable by Kong:** If Kong returns an error when proxying, it might mean it cannot resolve `backend-api.default.svc.cluster.local`. Make sure the service name and namespace are correct. If you named the service differently or deployed to another namespace, update the URL in Kong’s service. You can exec into the Kong pod (`kubectl exec -it <kong-pod> -n kong -- ping backend-api.default.svc.cluster.local`) to test DNS resolution inside the pod.
-- **JWT token issues:** Common problems are mismatched `iss` or wrong keys. Remember:
-  - The `iss` claim in the JWT must match the `key` field in Kong’s consumer JWT credential.
-  - Use correct RSA keys and include the `-----BEGIN PUBLIC KEY-----` and end lines when uploading the public key (unless using HTTP API with proper encoding, as we did).
-  - Check token expiration (`exp`). If the token is expired or not set, Kong will reject it. For testing, you can set a long exp (or re-generate if time passes).
-  - If using an online generator like jwt.io, ensure you select RS256 and paste the **private key** to sign. Also double-check no trailing spaces in the key input.
-- **OAuth2 Proxy setup:** This is likely the trickiest part.
-  - Make sure the **GitHub OAuth App** is configured with the correct callback URL (whatever your environment uses, e.g., `http://localhost:4180/oauth2/callback` if going directly, or Kong’s proxy URL if going through Kong).
-  - The OAuth2 Proxy needs the client ID/secret from GitHub. If those are wrong, you’ll get an immediate error page on trying to log in.
-  - If login succeeds but the `/api/hello` still says unauthorized, it could be the cookie not being sent. For Postman, copying the cookie manually is needed. In a browser, the cookie domain and secure flags must be set such that it’s sent. In our config, we allowed it for domain `localhost` and not secure (since we’re on http).
-  - You might consider running `kubectl logs deploy/oauth2-proxy` to watch its output during login – it will often log what it’s doing or any errors (like “invalid cookie signature” or “no valid token found” etc).
-  - If using Kong to route to the proxy, ensure Kong’s route for `/oauth2/*` has `strip_path=false` as well (since OAuth2 Proxy expects those paths intact).
-- **Synchronization of Plugins:** Sometimes after adding a plugin, it might take a brief moment to propagate. Ensure your curls/Postman tests happen after you got a response from the Admin API. Kong typically applies changes immediately, but keep an eye on response codes.
-- **Time management in demo:** The OAuth2 login can take a bit of time (especially the first time you authenticate with your app on GitHub). To keep things smooth, one presenter can initiate the OAuth login in the background while another is explaining something else, so that by the time we need to demonstrate the result, the login is done. Alternatively, have a session already established (cookie) so you can directly show the authenticated call, then if needed, logout and show the redirect flow if time permits.
-- **Backup Plans:** Have screenshots ready for critical steps (e.g., Postman showing a 429 response with headers, jwt.io screen with the token, GitHub login page, etc.). In case live Minikube or internet fails, these can still convey what happened. For example, if GitHub OAuth is down or unreachable (internet issues), explain the flow verbally and perhaps show a pre-saved response.
-- **Clean-up and Re-deploy:** If things go really wrong, having a script (`setup_guide.md` or an init script) that tears down and sets up the known-good configuration can save time. Minikube can be reset with `minikube delete` (though that’s heavy-handed). Ideally, keep all YAML and command steps in order so you can retrace if needed.
-
-Lastly, remember to **practice the demo** as a team. Ensure each person’s part works and you know how to recover if a step fails. Given the multiple moving parts, dry runs will help catch environment-specific quirks. With good preparation, this comprehensive demo will impress the audience, showing how API gateways like Kong provide a robust solution for scalable API management with security and monitoring features built-in. Good luck, and enjoy demonstrating your “secure mini-API platform” on June 2nd!
+Armed with this knowledge, our team should be comfortable with the demo architecture and confident in presenting how API gateways like Kong secure and manage microservice APIs. This setup demonstrates a practical, centralized way to enforce **authentication, rate limiting, and monitoring** – critical aspects of API management – in both development and production environments. By using industry-standard tools (Kong, OAuth2 Proxy, JWTs) and protocols (OAuth2/OIDC, JWT), we ensure our API can be protected in a robust and scalable manner, whether running locally or in the cloud.
