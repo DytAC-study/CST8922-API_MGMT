@@ -872,25 +872,30 @@ Specifically, we'll:
 ### 🧱 1. Deploy a mock logging service
 
 ```bash
-kubectl run mock-logger --image=kennethreitz/httpbin --port=80
-kubectl expose pod mock-logger --port=80 --target-port=80 --name=mock-logger
+kubectl apply -f mock-logger.yaml
+kubectl get pods
+kubectl get svc
 ```
 
 ### 🧩 2. Enable Kong http-log plugin on a specific route
 
 ```powershell
-curl.exe -k -X POST https://127.0.0.1:<admin-port>/routes/<your-route-id>/plugins `
-  --data name=http-log `
-  --data config.http_endpoint=http://mock-logger.default.svc.cluster.local/post `
-  --data config.method=POST `
-  --data config.timeout=1000 `
-  --data config.keepalive=1000
+curl.exe -k https://127.0.0.1:<admin-port>/routes
+
+curl.exe -k -X POST https://127.0.0.1:<admin-port>/routes/<route-id>/plugins `
+  --data "name=http-log" `
+  --data "config.http_endpoint=http://mock-logger.default.svc.cluster.local" `
+  --data "config.method=POST" `
+  --data "config.timeout=1000" `
+  --data "config.keepalive=1000" `
+  --data "config.headers.log-source=kong"
+
 ```
 
 ✅ You can now inspect logs from:
 
 ```bash
-kubectl logs pod/<mock-logger-pod-name>
+kubectl logs deployment/mock-logger
 ```
 
 ------

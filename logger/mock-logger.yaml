@@ -1,0 +1,31 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mock-logger
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mock-logger
+  template:
+    metadata:
+      labels:
+        app: mock-logger
+    spec:
+      containers:
+        - name: echo
+          image: mendhak/http-https-echo
+          ports:
+            - containerPort: 80
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mock-logger
+spec:
+  selector:
+    app: mock-logger
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 8080
